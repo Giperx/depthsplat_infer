@@ -68,6 +68,12 @@ class EncoderDepthSplatCfg:
     # multi-view matching
     local_mv_match: int
 
+    # DINOv2 backbone source for the monodepth branch.  ``None`` keeps the
+    # default torch.hub behaviour (required for training / existing configs);
+    # a local directory containing ``hubconf.py`` avoids any network access.
+    dinov2_source: str | None = None
+    dinov2_pretrained: bool = True
+
 
 class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
     def __init__(self, cfg: EncoderDepthSplatCfg) -> None:
@@ -78,6 +84,8 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
             upsample_factor=cfg.upsample_factor,
             lowest_feature_resolution=cfg.lowest_feature_resolution,
             vit_type=cfg.monodepth_vit_type,
+            dinov2_source=cfg.dinov2_source,
+            dinov2_pretrained=cfg.dinov2_pretrained,
             unet_channels=cfg.depth_unet_channels,
             grid_sample_disable_cudnn=cfg.grid_sample_disable_cudnn,
         )

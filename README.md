@@ -434,6 +434,7 @@ python scripts/inference_nuscenes_wide.py \
   --resolution 448x768 \
   --scene 037 \
   --frame 0 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --width-factor 2 \
   --output-dir outputs/nuscenes_wide
 ```
@@ -468,6 +469,33 @@ with `0.1`, the `256x448` dl3dv model with the `3.0` default); use
 compatible checkpoint; the encoder architecture is loaded strictly, so a
 mismatched checkpoint fails loudly (missing *or* unexpected keys) instead of
 silently leaving parts of the encoder randomly initialized.
+
+### Offline DINOv2 requirement
+
+The monodepth branch uses the DINOv2 ViT backbone. `MultiViewUniMatch` normally
+loads it with `torch.hub.load("facebookresearch/dinov2", ...)`, which may hit the
+network. This standalone path is explicitly offline: it passes a **local**
+torch.hub source and never downloads DINOv2.
+
+- `--dinov2-source` must point at the local DINOv2 torch.hub checkout (the
+  directory must contain `hubconf.py`). It defaults to `$DINOV2_SOURCE`, then to
+  the standard cache `~/.cache/torch/hub/facebookresearch_dinov2_main` when that
+  directory already exists. If neither resolves to a directory containing
+  `hubconf.py`, the script fails **before** building the model with a message
+  explaining `--dinov2-source`; there is no network fallback.
+- The composed encoder config always sets `model.encoder.dinov2_pretrained=false`
+  for inference. The trained DINOv2 weights are part of the DepthSplat
+  checkpoint under `encoder.depth_predictor.pretrained.*` (174 tensors), so the
+  architecture is built with random weights and then strict-loaded from the
+  checkpoint. Setting `pretrained=false` is therefore intentional: it avoids
+  downloading weights that would be overwritten immediately, and the strict load
+  still guarantees the final weights are exactly the checkpoint's.
+- Existing training commands (`python -m src.main ...`) are unchanged: with no
+  `dinov2_source` set, `dinov2_pretrained=true` and the default
+  `torch.hub.load("facebookresearch/dinov2", ...)` behaviour is preserved.
+
+To populate the cache once, run an ordinary DINOv2 `torch.hub.load` while online,
+or clone `facebookresearch/dinov2` and point `--dinov2-source` at the clone.
 
 ### Resize, intrinsics and patch sizes
 

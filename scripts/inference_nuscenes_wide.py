@@ -74,6 +74,71 @@ DEFAULT_WIDTH_FACTOR = 2.0
 FALLBACK_EFFECTIVE_PATCH_SIZE = 64
 
 
+# ---------------------------------------------------------------------------
+# DINOv2 local source helpers (torch-free)
+# ---------------------------------------------------------------------------
+#
+# The canonical helpers live in
+# ``src/model/encoder/unimatch/dinov2_source.py``.  A normal import of that
+# module would execute ``src/model/encoder/__init__.py``, which imports torch;
+# this script (and ``--help``) must work without torch, so load the standalone
+# module directly by path and re-export its helpers.
+
+
+def _load_dinov2_source_helpers():
+    import importlib.util
+
+    helper_path = (
+        REPO_ROOT
+        / "src"
+        / "model"
+        / "encoder"
+        / "unimatch"
+        / "dinov2_source.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_depthsplat_dinov2_source", helper_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load DINOv2 source helpers from {helper_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_dinov2_source = _load_dinov2_source_helpers()
+
+HUB_MARKER = _dinov2_source.HUB_MARKER
+DINOV2_ENV_VAR = _dinov2_source.DINOV2_ENV_VAR
+DEFAULT_DINOV2_HUB_CACHE = _dinov2_source.DEFAULT_DINOV2_HUB_CACHE
+is_valid_dinov2_source = _dinov2_source.is_valid_dinov2_source
+validate_dinov2_source = _dinov2_source.validate_dinov2_source
+default_dinov2_source = _dinov2_source.default_dinov2_source
+
+
+def resolve_dinov2_source(source) -> Path:
+    """Validate the ``--dinov2-source`` value, failing loudly when unavailable.
+
+    Offline inference deliberately has no network fallback: ``source`` must be a
+    directory containing ``hubconf.py``.
+    """
+    if source is None:
+        raise SystemExit(
+            "No local DINOv2 source available and offline inference never "
+            "downloads it from the network. Pass --dinov2-source "
+            "/path/to/facebookresearch_dinov2_main (the directory must contain "
+            f"{HUB_MARKER}), or set {DINOV2_ENV_VAR}. The standard torch.hub "
+            f"cache location is {DEFAULT_DINOV2_HUB_CACHE}."
+        )
+    try:
+        return validate_dinov2_source(source)
+    except ValueError as error:
+        raise SystemExit(
+            f"Invalid --dinov2-source: {error} The source must be a directory "
+            f"containing {HUB_MARKER}."
+        ) from error
+
+
 @dataclass(frozen=True)
 class ModelPreset:
     """Architecture preset compatible with one of the locally shipped checkpoints."""
@@ -467,6 +532,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional override of gaussian_adapter.gaussian_scale_max.",
     )
+    _default_dinov2_source = default_dinov2_source()
+    model.add_argument(
+        "--dinov2-source",
+        default=(
+            str(_default_dinov2_source)
+            if _default_dinov2_source is not None
+            else None
+        ),
+        help=(
+            "Local DINOv2 torch.hub source directory (must contain hubconf.py). "
+            f"Defaults to ${DINOV2_ENV_VAR}, else "
+            f"{DEFAULT_DINOV2_HUB_CACHE} when it exists. Offline inference never "
+            "downloads DINOv2; a missing/invalid source is an error."
+        ),
+    )
 
     render = parser.add_argument_group("rendering")
     render.add_argument(
@@ -534,8 +614,15 @@ def resolve_local(path: str, base: Path = REPO_ROOT) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def compose_config_dict(args, preset: ModelPreset):
-    """Compose the repository Hydra config for the dl3dv experiment."""
+def compose_config_dict(args, preset: ModelPreset, dinov2_source=None):
+    """Compose the repository Hydra config for the dl3dv experiment.
+
+    ``dinov2_source`` (a validated local directory) is composed into the encoder
+    config with ``dinov2_pretrained=false``: the full checkpoint carries the
+    trained DINOv2 weights under ``encoder.depth_predictor.pretrained.*``, so the
+    architecture is built with random weights and then strict-loaded, never
+    downloading DINOv2 from the network.
+    """
     from hydra import compose, initialize_config_dir
 
     config_dir = REPO_ROOT / "config"
@@ -554,6 +641,9 @@ def compose_config_dict(args, preset: ModelPreset):
         f"{gaussian_scale_max}",
         f"dataset.image_shape=[{preset.height},{preset.width}]",
     ]
+    if dinov2_source is not None:
+        overrides.append(f"model.encoder.dinov2_source={dinov2_source}")
+        overrides.append("model.encoder.dinov2_pretrained=false")
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg_dict = compose(config_name="main", overrides=overrides)
     return cfg_dict
@@ -826,8 +916,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     preset_height = args.height if args.height is not None else preset.height
     preset_width = args.width if args.width is not None else preset.width
 
+    # DINOv2 must resolve to a valid local source for real inference: this path
+    # deliberately has no network fallback. ``--dry-run`` never builds a model,
+    # so it may proceed without one.
+    try:
+        dinov2_source = resolve_dinov2_source(args.dinov2_source)
+    except SystemExit:
+        if not args.dry_run:
+            raise
+        dinov2_source = None
+
     # Compose config early (cheap, no torch) so the effective patch size is explicit.
-    cfg_dict = compose_config_dict(args, preset)
+    cfg_dict = compose_config_dict(args, preset, dinov2_source)
     patch_size = effective_patch_size(cfg_dict)
     if patch_size != FALLBACK_EFFECTIVE_PATCH_SIZE:
         print(

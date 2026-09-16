@@ -12,6 +12,7 @@ from .matching import warp_with_pose_depth_candidates
 from .utils import mv_feature_add_position
 from .dpt_head import DPTHead
 from .ldm_unet.unet import UNetModel, AttentionBlock
+from .dinov2_source import validate_dinov2_source
 from einops import rearrange
 
 
@@ -27,6 +28,8 @@ class MultiViewUniMatch(nn.Module):
         num_transformer_layers=6,
         num_depth_candidates=128,
         vit_type="vits",
+        dinov2_source=None,
+        dinov2_pretrained=True,
         unet_channels=128,
         unet_channel_mult=[1, 1, 1],
         unet_num_res_blocks=1,
@@ -78,9 +81,25 @@ class MultiViewUniMatch(nn.Module):
 
         # monodepth
         encoder = vit_type  # can also be 'vitb' or 'vitl'
-        self.pretrained = torch.hub.load(
-            "facebookresearch/dinov2", "dinov2_{:}14".format(encoder)
-        )
+        if dinov2_source is not None:
+            # Offline / reproducible path: load explicitly from a local DINOv2
+            # torch.hub source.  ``pretrained=False`` constructs the random
+            # architecture which is then overwritten when the full DepthSplat
+            # checkpoint (which contains ``...pretrained.*`` keys) is loaded.
+            local_source = str(validate_dinov2_source(dinov2_source))
+            self.pretrained = torch.hub.load(
+                local_source,
+                "dinov2_{:}14".format(encoder),
+                source="local",
+                pretrained=dinov2_pretrained,
+            )
+        else:
+            # Default training behaviour: let torch.hub resolve/download DINOv2.
+            self.pretrained = torch.hub.load(
+                "facebookresearch/dinov2",
+                "dinov2_{:}14".format(encoder),
+                pretrained=dinov2_pretrained,
+            )
 
         del self.pretrained.mask_token  # unused
 

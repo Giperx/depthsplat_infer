@@ -280,5 +280,103 @@ class IntrinsicsParsingTest(unittest.TestCase):
             wide.parse_pixel_intrinsics("1 2 3")
 
 
+class Dinov2SourceTest(unittest.TestCase):
+    """Offline DINOv2 source resolution/validation (no network fallback)."""
+
+    def _make_source(self, tmp, with_hubconf=True):
+        source = Path(tmp) / "facebookresearch_dinov2_main"
+        source.mkdir(parents=True)
+        if with_hubconf:
+            (source / wide.HUB_MARKER).write_text("dependencies = ['torch']\n")
+        return source
+
+    def test_valid_source_with_hubconf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self._make_source(tmp)
+            self.assertTrue(wide.is_valid_dinov2_source(source))
+            self.assertEqual(wide.validate_dinov2_source(source), source)
+            self.assertEqual(wide.resolve_dinov2_source(str(source)), source)
+
+    def test_source_without_hubconf_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = self._make_source(tmp, with_hubconf=False)
+            self.assertFalse(wide.is_valid_dinov2_source(source))
+            with self.assertRaises(ValueError):
+                wide.validate_dinov2_source(source)
+            with self.assertRaises(SystemExit):
+                wide.resolve_dinov2_source(str(source))
+
+    def test_missing_directory_rejected(self):
+        missing = Path("/nonexistent/dinov2/source")
+        self.assertFalse(wide.is_valid_dinov2_source(missing))
+        with self.assertRaises(ValueError):
+            wide.validate_dinov2_source(missing)
+
+    def test_none_source_fails_loudly(self):
+        with self.assertRaises(SystemExit) as ctx:
+            wide.resolve_dinov2_source(None)
+        message = str(ctx.exception)
+        self.assertIn("--dinov2-source", message)
+        self.assertIn(wide.HUB_MARKER, message)
+
+    def test_default_prefers_env_var(self):
+        env = {wide.DINOV2_ENV_VAR: "/tmp/custom_dinov2"}
+        self.assertEqual(
+            wide.default_dinov2_source(env), Path("/tmp/custom_dinov2")
+        )
+
+    def test_default_none_when_cache_missing(self):
+        # An empty environment with a non-existent cache returns None.
+        # ``default_dinov2_source`` resolves its cache constant from the helper
+        # module, so patch it there.
+        helper = wide._dinov2_source
+        original = helper.DEFAULT_DINOV2_HUB_CACHE
+        helper.DEFAULT_DINOV2_HUB_CACHE = Path("/nonexistent/dinov2/cache")
+        try:
+            self.assertIsNone(wide.default_dinov2_source(env={}))
+        finally:
+            helper.DEFAULT_DINOV2_HUB_CACHE = original
+
+
+class ComposeConfigDinov2Test(unittest.TestCase):
+    """The inference config overrides force local, non-pretrained DINOv2."""
+
+    def setUp(self):
+        try:
+            import hydra  # noqa: F401
+        except ImportError:  # pragma: no cover - environment dependent
+            self.skipTest("hydra is required to compose the repository config")
+
+    def test_compose_sets_local_source_and_disables_pretrained(self):
+        args = wide.build_arg_parser().parse_args([])
+        preset = wide.MODEL_PRESETS[wide.DEFAULT_PRESET]
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "facebookresearch_dinov2_main"
+            source.mkdir(parents=True)
+            (source / wide.HUB_MARKER).write_text("dependencies = ['torch']\n")
+            cfg_dict = wide.compose_config_dict(args, preset, source)
+        self.assertEqual(str(cfg_dict.model.encoder.dinov2_source), str(source))
+        self.assertFalse(bool(cfg_dict.model.encoder.dinov2_pretrained))
+
+    def test_compose_without_source_keeps_training_defaults(self):
+        args = wide.build_arg_parser().parse_args([])
+        preset = wide.MODEL_PRESETS[wide.DEFAULT_PRESET]
+        cfg_dict = wide.compose_config_dict(args, preset, None)
+        self.assertIsNone(cfg_dict.model.encoder.dinov2_source)
+        self.assertTrue(bool(cfg_dict.model.encoder.dinov2_pretrained))
+
+
+class CliDinov2DefaultTest(unittest.TestCase):
+    def test_parser_exposes_dinov2_source_option(self):
+        parser = wide.build_arg_parser()
+        args = parser.parse_args([])
+        self.assertTrue(hasattr(args, "dinov2_source"))
+
+    def test_explicit_source_is_parsed(self):
+        parser = wide.build_arg_parser()
+        args = parser.parse_args(["--dinov2-source", "/tmp/some/source"])
+        self.assertEqual(args.dinov2_source, "/tmp/some/source")
+
+
 if __name__ == "__main__":
     unittest.main()

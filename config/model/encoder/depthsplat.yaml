@@ -33,6 +33,14 @@ local_mv_match: 2
 # monodepth
 monodepth_vit_type: vits
 
+# DINOv2 monodepth backbone.
+# dinov2_source: local torch.hub source directory (must contain hubconf.py) used
+# to avoid network access. null keeps the default torch.hub("facebookresearch/dinov2")
+# behaviour so existing training configs are unchanged.
+# dinov2_pretrained: load the DINOv2 pretrained weights at construction time.
+dinov2_source: null
+dinov2_pretrained: true
+
 # return depth
 supervise_intermediate_depth: true
 return_depth: true
