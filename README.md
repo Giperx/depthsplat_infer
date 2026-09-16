@@ -420,6 +420,97 @@ We fine-tune our Gaussian Splatting pre-trained depth model using ground-truth d
 </p>
 
 
+## nuScenes Wide-View Inference
+
+`scripts/inference_nuscenes_wide.py` is a standalone, single-frame nuScenes
+inference path. It reconstructs Gaussians from cameras `5, 4, 3` of one frame and
+renders a horizontally widened image from camera `5`, without going through the
+Lightning `ModelWrapper.test_step` (which assumes a ground-truth target view).
+
+### Usage
+
+```bash
+python scripts/inference_nuscenes_wide.py \
+  --resolution 448x768 \
+  --scene 037 \
+  --frame 0 \
+  --width-factor 2 \
+  --output-dir outputs/nuscenes_wide
+```
+
+- Scene ids default to `datasets/nuscenes/processed_10Hz/trainval2/nuScenes_Val2.txt`
+  (`--scene-list` / `--data-root` override this) and one frame per scene is
+  processed by default (`--max-frames 1`, `-1` for all frames; `--scene` /
+  `--frame` select a single scene/frame).
+- `--dry-run` validates and loads a frame (images, intrinsics, extrinsics)
+  without building the model, which is useful on machines without the CUDA
+  rasterizer extension.
+- Output is written to `<output-dir>/<scene>/rgb/{frame}_{render_cam}_wide.jpg`
+  at JPEG quality 95. With `--save-inputs` the resized context images are also
+  written to `<output-dir>/<scene>/inputs/{frame}_{cam}.jpg`.
+
+### Checkpoints and input resolutions
+
+The resolution preset selects the matching locally shipped base checkpoint:
+
+| `--resolution` | Default checkpoint | Input | Output (factor 2) | `gaussian_scale_max` |
+| --- | --- | --- | --- | --- |
+| `448x768` (default) | `pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth` | 448x768 | 448x1536 | 0.1 |
+| `256x448` | `pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth` | 256x448 | 256x896 | 3.0 |
+
+Both are 117M `vitb` models, so the script sets
+`monodepth_vit_type=vitb`, `num_scales=2`, `upsample_factor=4` and
+`lowest_feature_resolution=8`. `gaussian_scale_max` is part of the trained
+architecture rather than a free rendering knob, so it is carried on the preset
+and is always composed into the encoder config (the `448x768` model was trained
+with `0.1`, the `256x448` dl3dv model with the `3.0` default); use
+`--gaussian-scale-max` to override it. Use `--checkpoint` to load another
+compatible checkpoint; the encoder architecture is loaded strictly, so a
+mismatched checkpoint fails loudly (missing *or* unexpected keys) instead of
+silently leaving parts of the encoder randomly initialized.
+
+### Resize, intrinsics and patch sizes
+
+- Context images are resized with aspect preservation (`scale = max(dst_h/src_h,
+  dst_w/src_w)`) and then centre-cropped to the model input resolution. Each
+  camera's pixel K is adjusted through the same resize/crop and converted to the
+  normalized K used by DepthSplat
+  (`[[fx/W, 0, cx/W], [0, fy/H, cy/H], [0, 0, 1]]`).
+- **14 vs effective patch size.** DINOv2 operates on 14-pixel patches and the
+  encoder internally floors the image to a multiple of 14. That is a *different*
+  constraint from the data-shim crop, which aligns the CNN/UNet/cost-volume to a
+  multiple of the *effective* patch size
+  `shim_patch_size * downscale_factor` (the `dl3dv` experiment uses 16 * 4 = 64,
+  the default/re10k settings use 4 * 4 = 16). This script rounds the requested
+  input size down to a multiple of the effective patch size read from the
+  composed config, and leaves the encoder's internal 14-pixel rounding to the
+  model. Both `448x768` and `256x448` are already multiples of 64, so no extra
+  crop is applied for the defaults.
+- The wide render keeps camera 5's resized pixel focal length (`fx`, `fy`) and
+  `cy` and sets `cx = wide_W / 2`, so the per-pixel angular scale and the output
+  height are unchanged while the horizontal field of view widens by
+  `--width-factor`. The wide pixel K is normalized before being passed to the
+  decoder with `image_shape=(H, wide_W)`.
+- The decoder builds its projection from the normalized K using an **asymmetric
+  frustum**: for pixel intrinsics `fx, fy, cx, cy` it realizes exactly
+  `u = fx * X/Z + cx`, `v = fy * Y/Z + cy` (rasterizer convention
+  `ndc = 2 * (u/W, v/H) - 1`). Principal-point offsets are therefore honoured
+  rather than collapsed into a symmetric field of view, which matters for the
+  preserved (possibly off-centre) `cy` of the wide view and for any context K
+  that is not exactly centred. For a centred K (`cx = W/2`, `cy = H/2`) the
+  projection is identical to the previous symmetric behaviour.
+
+### Notes
+
+- The Gaussian splatting decoder requires the CUDA extension
+  `diff-gaussian-rasterization-modified` (see `requirements.txt`); the script
+  reports a clear error if it is missing.
+- DepthSplat's decoder exposes rendered color and depth only; it does not expose
+  an alpha mask, so no mask is written (rather than inventing a misleading one).
+- The released checkpoints were not trained on nuScenes, and a 2x-wide camera-5
+  frustum is outside the training distribution, so results are for research
+  exploration rather than a trained-model benchmark.
+
 ## Citation
 
 ```

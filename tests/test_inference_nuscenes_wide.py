@@ -1,0 +1,284 @@
+"""Focused tests for the nuScenes wide-view inference helpers.
+
+Run from the repository root with::
+
+    python -m unittest tests.test_inference_nuscenes_wide
+
+The tests only exercise the pure helpers (resize/crop, intrinsics adjustment,
+pixel-to-normalized K conversion, wide-K construction and data enumeration) so
+they do not require CUDA or the Gaussian rasterizer.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_PATH = REPO_ROOT / "scripts" / "inference_nuscenes_wide.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location(
+        "inference_nuscenes_wide", SCRIPT_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load module from {SCRIPT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    # Register before execution so dataclasses can resolve the module in 3.10.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+wide = _load_module()
+
+try:  # torch is only needed for the strict-loading tests.
+    import torch
+except ImportError:  # pragma: no cover - environment dependent
+    torch = None
+
+
+class ModelPresetGaussianScaleTest(unittest.TestCase):
+    """The gaussian scale max is part of the checkpoint architecture."""
+
+    def test_preset_scale_max_values(self):
+        self.assertEqual(wide.MODEL_PRESETS["448x768"].gaussian_scale_max, 0.1)
+        self.assertEqual(wide.MODEL_PRESETS["256x448"].gaussian_scale_max, 3.0)
+
+    def test_every_preset_carries_scale_max(self):
+        for preset in wide.MODEL_PRESETS.values():
+            self.assertIsInstance(preset.gaussian_scale_max, float)
+
+
+@unittest.skipIf(torch is None, "torch is required for these checks")
+class StrictEncoderLoadingTest(unittest.TestCase):
+    """``load_encoder_state_dict`` must fail loudly on any key mismatch."""
+
+    def _make_encoder(self):
+        import torch.nn as nn
+
+        class TinyEncoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(3, 2)
+
+        return TinyEncoder()
+
+    def _state(self, encoder):
+        return {key: value.clone() for key, value in encoder.state_dict().items()}
+
+    def test_matching_state_loads(self):
+        encoder = self._make_encoder()
+        wide.load_encoder_state_dict(encoder, self._state(encoder))
+
+    def test_missing_key_fails_loudly(self):
+        encoder = self._make_encoder()
+        state = self._state(encoder)
+        del state["linear.weight"]
+        with self.assertRaises(SystemExit):
+            wide.load_encoder_state_dict(encoder, state)
+
+    def test_unexpected_key_fails_loudly(self):
+        encoder = self._make_encoder()
+        state = self._state(encoder)
+        state["extra.weight"] = torch.zeros(1, 1)
+        with self.assertRaises(SystemExit):
+            wide.load_encoder_state_dict(encoder, state)
+
+
+class ResizeCropPlanTest(unittest.TestCase):
+    def test_plan_for_448x768_from_1600x900(self):
+        plan = wide.plan_resize_and_crop((900, 1600), (448, 768))
+        # scale = max(448/900, 768/1600) = 0.49777...
+        self.assertEqual((plan.scaled_h, plan.scaled_w), (448, 796))
+        self.assertEqual((plan.row, plan.col), (0, 14))
+        self.assertEqual((plan.out_h, plan.out_w), (448, 768))
+
+    def test_plan_keeps_aspect_and_crops_long_side(self):
+        plan = wide.plan_resize_and_crop((720, 1280), (448, 768))
+        # The shorter-aspect dimension fills the target, the other overflows.
+        self.assertGreaterEqual(plan.scaled_h, 448)
+        self.assertGreaterEqual(plan.scaled_w, 768)
+        self.assertTrue(plan.scaled_h == 448 or plan.scaled_w == 768)
+
+    def test_plan_identity(self):
+        plan = wide.plan_resize_and_crop((448, 768), (448, 768))
+        self.assertEqual((plan.scaled_h, plan.scaled_w), (448, 768))
+        self.assertEqual((plan.row, plan.col), (0, 0))
+
+    def test_invalid_shapes(self):
+        with self.assertRaises(ValueError):
+            wide.plan_resize_and_crop((0, 100), (10, 10))
+
+
+class IntrinsicsTest(unittest.TestCase):
+    CAM5 = wide.PixelIntrinsics(809.22099, 809.22099, 829.21960, 481.77842)
+
+    def test_resize_and_crop_adjusts_pixel_k(self):
+        plan = wide.plan_resize_and_crop((900, 1600), (448, 768))
+        resized = wide.resize_and_crop_intrinsics(self.CAM5, plan)
+        self.assertAlmostEqual(resized.fx, self.CAM5.fx * 796 / 1600, places=6)
+        self.assertAlmostEqual(resized.fy, self.CAM5.fy * 448 / 900, places=6)
+        self.assertAlmostEqual(resized.cx, self.CAM5.cx * 796 / 1600 - 14, places=6)
+        self.assertAlmostEqual(resized.cy, self.CAM5.cy * 448 / 900, places=6)
+
+    def test_normalized_k_matches_definition(self):
+        plan = wide.plan_resize_and_crop((900, 1600), (448, 768))
+        resized = wide.resize_and_crop_intrinsics(self.CAM5, plan)
+        normalized = wide.pixel_to_normalized_intrinsics(resized, 448, 768)
+        expected = np.array(
+            [
+                [resized.fx / 768, 0.0, resized.cx / 768],
+                [0.0, resized.fy / 448, resized.cy / 448],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        np.testing.assert_allclose(normalized, expected, rtol=1e-6, atol=1e-9)
+
+    def test_normalized_focal_is_invariant_to_resize(self):
+        # Pure resizing (no crop) must not change the normalized intrinsics.
+        plan = wide.plan_resize_and_crop((900, 1600), (448, 768))
+        scale_x = plan.scaled_w / plan.src_w
+        scale_y = plan.scaled_h / plan.src_h
+        resized_only = wide.PixelIntrinsics(
+            self.CAM5.fx * scale_x,
+            self.CAM5.fy * scale_y,
+            self.CAM5.cx * scale_x,
+            self.CAM5.cy * scale_y,
+        )
+        original = wide.pixel_to_normalized_intrinsics(self.CAM5, 900, 1600)
+        resized = wide.pixel_to_normalized_intrinsics(
+            resized_only, plan.scaled_h, plan.scaled_w
+        )
+        np.testing.assert_allclose(original, resized, rtol=1e-9, atol=1e-12)
+
+    def test_crop_only_shifts_and_rescales_normalized_x(self):
+        plan = wide.plan_resize_and_crop((900, 1600), (448, 768))
+        resized = wide.resize_and_crop_intrinsics(self.CAM5, plan)
+        adjusted = wide.pixel_to_normalized_intrinsics(resized, 448, 768)
+        # The crop removes `col` pixels; the normalized focal length grows by
+        # scaled_w / out_w relative to the resize-only value.
+        expected_fx = (self.CAM5.fx * plan.scaled_w / plan.src_w) / plan.out_w
+        self.assertAlmostEqual(adjusted[0, 0], expected_fx, places=6)
+
+    def test_pixel_to_normalized_rejects_bad_size(self):
+        with self.assertRaises(ValueError):
+            wide.pixel_to_normalized_intrinsics(self.CAM5, 0, 100)
+
+
+class WideIntrinsicsTest(unittest.TestCase):
+    CAM5 = wide.PixelIntrinsics(402.792, 402.792, 398.792, 239.752)
+
+    def test_wide_pixel_k(self):
+        wide_px, (out_h, out_w) = wide.make_wide_intrinsics(self.CAM5, (448, 768), 2.0)
+        self.assertEqual((out_h, out_w), (448, 1536))
+        self.assertAlmostEqual(wide_px.fx, self.CAM5.fx, places=6)
+        self.assertAlmostEqual(wide_px.fy, self.CAM5.fy, places=6)
+        self.assertAlmostEqual(wide_px.cx, 1536 / 2.0, places=6)
+        self.assertAlmostEqual(wide_px.cy, self.CAM5.cy, places=6)
+
+    def test_wide_normalized_focal_halves_and_center(self):
+        wide_px, (out_h, out_w) = wide.make_wide_intrinsics(self.CAM5, (448, 768), 2.0)
+        base_norm = wide.pixel_to_normalized_intrinsics(self.CAM5, 448, 768)
+        wide_norm = wide.pixel_to_normalized_intrinsics(wide_px, out_h, out_w)
+        # Keeping the pixel focal length while doubling the width halves the
+        # normalized focal length.
+        self.assertAlmostEqual(wide_norm[0, 0], base_norm[0, 0] / 2.0, places=6)
+        self.assertAlmostEqual(wide_norm[0, 2], 0.5, places=6)
+        # Height (and its focal / principal point) is unchanged.
+        self.assertAlmostEqual(wide_norm[1, 1], base_norm[1, 1], places=6)
+        self.assertAlmostEqual(wide_norm[1, 2], base_norm[1, 2], places=6)
+
+    def test_wide_non_integer_factor(self):
+        wide_px, (out_h, out_w) = wide.make_wide_intrinsics(self.CAM5, (448, 768), 3.0)
+        self.assertEqual((out_h, out_w), (448, 2304))
+        self.assertAlmostEqual(wide_px.cx, 1152.0, places=6)
+
+    def test_wide_rejects_bad_factor(self):
+        with self.assertRaises(ValueError):
+            wide.make_wide_intrinsics(self.CAM5, (448, 768), 0.0)
+
+
+class PatchRoundingTest(unittest.TestCase):
+    def test_round_down(self):
+        self.assertEqual(wide.round_hw_to_multiple((450, 770), 64), (448, 768))
+        self.assertEqual(wide.round_hw_to_multiple((448, 768), 64), (448, 768))
+
+    def test_minimum_one_patch(self):
+        self.assertEqual(wide.round_hw_to_multiple((10, 20), 64), (64, 64))
+
+    def test_bad_multiple(self):
+        with self.assertRaises(ValueError):
+            wide.round_hw_to_multiple((64, 64), 0)
+
+
+class EnumerationTest(unittest.TestCase):
+    def test_read_scene_list_skips_blank_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "list.txt"
+            path.write_text("037\n074\n\n  \n")
+            self.assertEqual(wide.read_scene_list(path), ["037", "074"])
+
+    def test_enumerate_frames_filters_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = Path(tmp) / "037"
+            images = scene_dir / "images"
+            images.mkdir(parents=True)
+            for frame in ("000", "001", "002"):
+                for cam in (5, 4, 3):
+                    (images / f"{frame}_{cam}.jpg").write_bytes(b"")
+            # Frame 003 is missing camera 4 and must be dropped.
+            (images / "003_5.jpg").write_bytes(b"")
+            (images / "003_3.jpg").write_bytes(b"")
+
+            frames = wide.enumerate_frames(scene_dir, (5, 4, 3), max_frames=None)
+            self.assertEqual(frames, ["000", "001", "002"])
+
+    def test_enumerate_frames_max_and_single(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = Path(tmp) / "037"
+            images = scene_dir / "images"
+            images.mkdir(parents=True)
+            for frame in ("000", "001", "002"):
+                for cam in (5, 4, 3):
+                    (images / f"{frame}_{cam}.jpg").write_bytes(b"")
+
+            self.assertEqual(
+                wide.enumerate_frames(scene_dir, (5, 4, 3), max_frames=1), ["000"]
+            )
+            self.assertEqual(
+                wide.enumerate_frames(scene_dir, (5, 4, 3), frame="1"), ["001"]
+            )
+            self.assertEqual(
+                wide.enumerate_frames(scene_dir, (5, 4, 3), frame="000"), ["000"]
+            )
+
+    def test_enumerate_frames_missing_dir(self):
+        self.assertEqual(
+            wide.enumerate_frames(Path("/nonexistent/scene"), (5, 4, 3)), []
+        )
+
+
+class IntrinsicsParsingTest(unittest.TestCase):
+    def test_parse_9_values(self):
+        text = "\n".join(str(float(i)) for i in range(9))
+        k = wide.parse_pixel_intrinsics(text)
+        self.assertEqual((k.fx, k.fy, k.cx, k.cy), (0.0, 1.0, 2.0, 3.0))
+
+    def test_parse_comma_separated(self):
+        k = wide.parse_pixel_intrinsics("1,2,3,4,5,6,7,8,9")
+        self.assertEqual((k.fx, k.fy, k.cx, k.cy), (1.0, 2.0, 3.0, 4.0))
+
+    def test_parse_too_few_values(self):
+        with self.assertRaises(ValueError):
+            wide.parse_pixel_intrinsics("1 2 3")
+
+
+if __name__ == "__main__":
+    unittest.main()
