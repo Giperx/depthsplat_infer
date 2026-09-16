@@ -259,6 +259,22 @@ class EnumerationTest(unittest.TestCase):
                 wide.enumerate_frames(scene_dir, (5, 4, 3), frame="000"), ["000"]
             )
 
+    def test_enumerate_frames_negative_max_returns_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = Path(tmp) / "037"
+            images = scene_dir / "images"
+            images.mkdir(parents=True)
+            for frame in ("000", "001", "002"):
+                for cam in (5, 4, 3):
+                    (images / f"{frame}_{cam}.jpg").write_bytes(b"")
+
+            frames = wide.enumerate_frames(scene_dir, (5, 4, 3), max_frames=-1)
+            self.assertEqual(frames, ["000", "001", "002"])
+            self.assertEqual(
+                wide.enumerate_frames(scene_dir, (5, 4, 3), max_frames=None),
+                ["000", "001", "002"],
+            )
+
     def test_enumerate_frames_missing_dir(self):
         self.assertEqual(
             wide.enumerate_frames(Path("/nonexistent/scene"), (5, 4, 3)), []
@@ -376,6 +392,277 @@ class CliDinov2DefaultTest(unittest.TestCase):
         parser = wide.build_arg_parser()
         args = parser.parse_args(["--dinov2-source", "/tmp/some/source"])
         self.assertEqual(args.dinov2_source, "/tmp/some/source")
+
+
+class ParserDefaultsTest(unittest.TestCase):
+    """The CLI defaults must describe the full, no-input-saving run."""
+
+    def setUp(self):
+        self.args = wide.build_arg_parser().parse_args([])
+
+    def test_model_preset_default(self):
+        self.assertEqual(self.args.model, "448x768")
+        self.assertEqual(wide.DEFAULT_PRESET, "448x768")
+        # Input size defaults to the model preset (no explicit override).
+        self.assertIsNone(self.args.input_size)
+        self.assertIsNone(self.args.height)
+        self.assertIsNone(self.args.width)
+
+    def test_resolution_is_legacy_alias_for_model(self):
+        parser = wide.build_arg_parser()
+        legacy = parser.parse_args(["--resolution", "256x448"])
+        modern = parser.parse_args(["--model", "256x448"])
+        self.assertEqual(legacy.model, "256x448")
+        self.assertEqual(legacy.model, modern.model)
+
+    def test_scene_list_default(self):
+        self.assertEqual(
+            self.args.scene_list,
+            "datasets/nuscenes/processed_10Hz/trainval2/nuScenes_Val2.txt",
+        )
+        self.assertEqual(
+            self.args.scene_list, str(wide.DEFAULT_SCENE_LIST_PATH)
+        )
+        # No scene/frame restriction by default.
+        self.assertIsNone(self.args.scene)
+        self.assertIsNone(self.args.frame)
+
+    def test_max_frames_defaults_to_all(self):
+        self.assertEqual(self.args.max_frames, -1)
+        self.assertEqual(wide.DEFAULT_MAX_FRAMES, -1)
+
+    def test_save_inputs_off_by_default(self):
+        self.assertFalse(self.args.save_inputs)
+
+    def test_camera_defaults(self):
+        self.assertEqual(self.args.cameras, "5,4,3")
+        self.assertEqual(self.args.render_camera, 5)
+        self.assertEqual(self.args.width_factor, 2.0)
+
+    def test_output_dir_default(self):
+        self.assertEqual(self.args.output_dir, "outputs/nuscenes_wide")
+
+
+class ParseInputSizeTest(unittest.TestCase):
+    """``--input-size`` accepts HxW (and H,W / H W) and rejects bad values."""
+
+    def test_parses_x_separator(self):
+        self.assertEqual(wide.parse_hw("448x768"), (448, 768))
+        self.assertEqual(wide.parse_hw("256x448"), (256, 448))
+
+    def test_parses_other_separators_and_case(self):
+        self.assertEqual(wide.parse_hw("448,768"), (448, 768))
+        self.assertEqual(wide.parse_hw("448 768"), (448, 768))
+        self.assertEqual(wide.parse_hw("448X768"), (448, 768))
+
+    def test_rejects_malformed(self):
+        import argparse
+
+        for bad in ("448", "448x", "a x b", "448x768x1", ""):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                wide.parse_hw(bad)
+
+    def test_rejects_non_positive(self):
+        import argparse
+
+        for bad in ("0x768", "448x0", "-1x768"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                wide.parse_hw(bad)
+
+    def test_cli_parses_input_size(self):
+        args = wide.build_arg_parser().parse_args(
+            ["--model", "256x448", "--input-size", "256x448"]
+        )
+        self.assertEqual(args.model, "256x448")
+        self.assertEqual(args.input_size, (256, 448))
+
+    def test_cli_rejects_bad_input_size(self):
+        with self.assertRaises(SystemExit):
+            wide.build_arg_parser().parse_args(["--input-size", "nope"])
+
+    def test_cli_rejects_unknown_model(self):
+        with self.assertRaises(SystemExit):
+            wide.build_arg_parser().parse_args(["--model", "512x960"])
+
+
+class ResolveInputHwTest(unittest.TestCase):
+    """Input size is independent from the model preset but defaults to it."""
+
+    def setUp(self):
+        self.preset = wide.MODEL_PRESETS["256x448"]
+
+    def _args(self, **kwargs):
+        base = dict(
+            model="256x448", input_size=None, height=None, width=None
+        )
+        base.update(kwargs)
+        return type("Args", (), base)
+
+    def test_defaults_to_preset_size(self):
+        self.assertEqual(wide.resolve_input_hw(self._args(), self.preset), (256, 448))
+
+    def test_input_size_overrides_both(self):
+        args = self._args(input_size=(448, 768))
+        self.assertEqual(wide.resolve_input_hw(args, self.preset), (448, 768))
+
+    def test_height_width_override_individual_dimensions(self):
+        args = self._args(input_size=(448, 768), height=320)
+        self.assertEqual(wide.resolve_input_hw(args, self.preset), (320, 768))
+        args = self._args(input_size=(448, 768), width=1024)
+        self.assertEqual(wide.resolve_input_hw(args, self.preset), (448, 1024))
+        args = self._args(height=320, width=1024)
+        self.assertEqual(wide.resolve_input_hw(args, self.preset), (320, 1024))
+
+
+class ValidateCheckpointPresetTest(unittest.TestCase):
+    """A known other-preset checkpoint must be rejected with a clear error."""
+
+    def test_other_preset_checkpoint_rejected(self):
+        wrong = wide.resolve_local(wide.MODEL_PRESETS["448x768"].checkpoint)
+        with self.assertRaises(SystemExit) as ctx:
+            wide.validate_checkpoint_preset(wrong, "256x448")
+        message = str(ctx.exception)
+        self.assertIn("--model 448x768", message)
+        self.assertIn("--checkpoint", message)
+
+    def test_matching_preset_checkpoint_allowed(self):
+        right = wide.resolve_local(wide.MODEL_PRESETS["448x768"].checkpoint)
+        wide.validate_checkpoint_preset(right, "448x768")
+
+    def test_arbitrary_custom_checkpoint_allowed(self):
+        # Unknown filenames are deferred to the strict encoder load.
+        wide.validate_checkpoint_preset(
+            Path("/tmp/my_custom_checkpoint.pth"), "256x448"
+        )
+
+
+class ExtrinsicsSourceTest(unittest.TestCase):
+    """Default extrinsics source is the static cam2ego rig; per_frame is opt-in."""
+
+    def test_parser_default_is_cam2ego(self):
+        args = wide.build_arg_parser().parse_args([])
+        self.assertEqual(args.extrinsics_source, "cam2ego")
+        self.assertEqual(wide.DEFAULT_EXTRINSICS_SOURCE, "cam2ego")
+        self.assertEqual(wide.EXTRINSICS_SOURCE_CHOICES, ("cam2ego", "per_frame"))
+
+    def test_parser_accepts_per_frame(self):
+        args = wide.build_arg_parser().parse_args(
+            ["--extrinsics-source", "per_frame"]
+        )
+        self.assertEqual(args.extrinsics_source, "per_frame")
+
+    def test_parser_rejects_unknown_source(self):
+        with self.assertRaises(SystemExit):
+            wide.build_arg_parser().parse_args(
+                ["--extrinsics-source", "global"]
+            )
+
+    def test_resolve_path_cam2ego_default(self):
+        # No frame component: the static rig is per camera, not per frame.
+        self.assertEqual(
+            wide.resolve_extrinsics_path(Path("/scene"), "006", 3),
+            Path("/scene/cam2ego_extrinsics/3.txt"),
+        )
+        self.assertEqual(
+            wide.resolve_extrinsics_path(Path("/scene"), "006", 3, "cam2ego"),
+            Path("/scene/cam2ego_extrinsics/3.txt"),
+        )
+
+    def test_resolve_path_per_frame(self):
+        self.assertEqual(
+            wide.resolve_extrinsics_path(Path("/scene"), "006", 3, "per_frame"),
+            Path("/scene/extrinsics/006_3.txt"),
+        )
+
+    def test_resolve_path_rejects_unknown(self):
+        with self.assertRaises(ValueError):
+            wide.resolve_extrinsics_path(Path("/scene"), "006", 3, "global")
+
+
+class ExtrinsicsLoaderTest(unittest.TestCase):
+    """The loader reads exactly the file the selected source names."""
+
+    def setUp(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:  # pragma: no cover - environment dependent
+            self.skipTest("PIL is required to write temporary frame images")
+
+    @staticmethod
+    def _matrix_text(value):
+        rows = [
+            [1.0, 0.0, 0.0, value],
+            [0.0, 1.0, 0.0, value + 1.0],
+            [0.0, 0.0, 1.0, value + 2.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+        return "\n".join(" ".join(str(v) for v in row) for row in rows)
+
+    def _make_scene(self, tmp, cam2ego_value, per_frame_value):
+        from PIL import Image
+
+        scene_dir = Path(tmp) / "037"
+        for sub in ("images", "intrinsics", "cam2ego_extrinsics", "extrinsics"):
+            (scene_dir / sub).mkdir(parents=True)
+        for cam in (5, 4, 3):
+            Image.new("RGB", (8, 8), (0, 0, 0)).save(
+                scene_dir / "images" / f"000_{cam}.jpg"
+            )
+            (scene_dir / "intrinsics" / f"{cam}.txt").write_text(
+                "1 1 4 4 0 0 0 0 1"
+            )
+            (scene_dir / "cam2ego_extrinsics" / f"{cam}.txt").write_text(
+                self._matrix_text(cam2ego_value)
+            )
+            (scene_dir / "extrinsics" / f"000_{cam}.txt").write_text(
+                self._matrix_text(per_frame_value)
+            )
+        return scene_dir
+
+    def _load(self, scene_dir, source=None):
+        kwargs = {} if source is None else {"extrinsics_source": source}
+        return wide.load_frame_inputs(
+            scene_dir, "037", "000", (5, 4, 3), 5, (8, 8), (8, 8), **kwargs
+        )
+
+    def test_default_uses_cam2ego_translation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = self._make_scene(tmp, 1.0, 100.0)
+            inputs = self._load(scene_dir)
+            np.testing.assert_allclose(
+                inputs.extrinsics[:, :3, 3], np.tile([1.0, 2.0, 3.0], (3, 1))
+            )
+
+    def test_per_frame_uses_per_frame_translation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = self._make_scene(tmp, 1.0, 100.0)
+            inputs = self._load(scene_dir, "per_frame")
+            np.testing.assert_allclose(
+                inputs.extrinsics[:, :3, 3],
+                np.tile([100.0, 101.0, 102.0], (3, 1)),
+            )
+
+    def test_default_missing_cam2ego_fails_with_pointer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = self._make_scene(tmp, 1.0, 100.0)
+            for cam in (5, 4, 3):
+                (scene_dir / "cam2ego_extrinsics" / f"{cam}.txt").unlink()
+            with self.assertRaises(FileNotFoundError) as ctx:
+                self._load(scene_dir)
+            message = str(ctx.exception)
+            self.assertIn("cam2ego", message)
+            self.assertIn("--extrinsics-source per_frame", message)
+
+    def test_per_frame_missing_fails_with_pointer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = self._make_scene(tmp, 1.0, 100.0)
+            for cam in (5, 4, 3):
+                (scene_dir / "extrinsics" / f"000_{cam}.txt").unlink()
+            with self.assertRaises(FileNotFoundError) as ctx:
+                self._load(scene_dir, "per_frame")
+            message = str(ctx.exception)
+            self.assertIn("per-frame", message)
+            self.assertIn("--extrinsics-source cam2ego", message)
 
 
 if __name__ == "__main__":

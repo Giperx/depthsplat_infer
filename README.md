@@ -422,16 +422,42 @@ We fine-tune our Gaussian Splatting pre-trained depth model using ground-truth d
 
 ## nuScenes Wide-View Inference
 
-`scripts/inference_nuscenes_wide.py` is a standalone, single-frame nuScenes
-inference path. It reconstructs Gaussians from cameras `5, 4, 3` of one frame and
-renders a horizontally widened image from camera `5`, without going through the
-Lightning `ModelWrapper.test_step` (which assumes a ground-truth target view).
+`scripts/inference_nuscenes_wide.py` is a standalone nuScenes inference path. It
+reconstructs Gaussians from cameras `5, 4, 3` of a frame and renders a
+horizontally widened image from camera `5`, without going through the Lightning
+`ModelWrapper.test_step` (which assumes a ground-truth target view). By default
+it processes every scene in the scene list and every valid frame; extrinsics
+come from the static camera-to-ego rig (see
+[Extrinsics source](#extrinsics-source) below).
 
 ### Usage
 
 ```bash
+# Defaults: 448x768 model, every scene in the scene list, every valid frame,
+# no input images saved.
 python scripts/inference_nuscenes_wide.py \
-  --resolution 448x768 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_wide
+
+# Select the model preset and the input resize size explicitly (these are the
+# same as the defaults, shown for clarity):
+python scripts/inference_nuscenes_wide.py \
+  --model 448x768 \
+  --input-size 448x768 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_wide
+
+# The other local checkpoint, rendered at its native 256x448 input:
+python scripts/inference_nuscenes_wide.py \
+  --model 256x448 \
+  --input-size 256x448 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_wide_256x448
+
+# Render a single scene/frame instead:
+python scripts/inference_nuscenes_wide.py \
+  --model 448x768 \
+  --input-size 448x768 \
   --scene 037 \
   --frame 0 \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
@@ -439,10 +465,30 @@ python scripts/inference_nuscenes_wide.py \
   --output-dir outputs/nuscenes_wide
 ```
 
+- The model defaults to the `448x768` preset; context cameras default to
+  `5,4,3`, the render camera to `5`, and the output width factor to `2`.
+- `--model` selects the **architecture preset**: it fixes `vitb`,
+  `num_scales`, `upsample_factor`, `lowest_feature_resolution` and
+  `gaussian_scale_max`, and chooses the matching default checkpoint. It is
+  independent of the input size.
+- `--input-size HxW` sets the **input resize size** (e.g. `448x768`, also
+  accepted as `448,768` or `448 768`). It defaults to the `--model` preset size
+  and is rounded down to a multiple of the effective patch size (`64` for the
+  `dl3dv` experiment). `--height` / `--width` still work and override the
+  corresponding dimension of `--input-size` (highest priority).
+- `--resolution` is kept as a **legacy alias for `--model`** (same option, same
+  values), so existing commands like `--resolution 448x768` keep working.
 - Scene ids default to `datasets/nuscenes/processed_10Hz/trainval2/nuScenes_Val2.txt`
-  (`--scene-list` / `--data-root` override this) and one frame per scene is
-  processed by default (`--max-frames 1`, `-1` for all frames; `--scene` /
-  `--frame` select a single scene/frame).
+  (`--scene-list` overrides this; `--data-root` sets the scene folder root and,
+  while the default list is used, is where `<data-root>/nuScenes_Val2.txt` is
+  read from). Every scene in the list and **every valid frame per scene** are
+  processed by default; `--max-frames N` limits frames per scene (`-1`, the
+  default, means all), and `--scene` / `--frame` select a single scene/frame.
+- Input images are **not** saved by default; pass `--save-inputs` to also write
+  the resized context images.
+- Extrinsics default to the static camera-to-ego rig
+  (`--extrinsics-source cam2ego`); see [Extrinsics source](#extrinsics-source)
+  for the `per_frame` A/B alternative.
 - `--dry-run` validates and loads a frame (images, intrinsics, extrinsics)
   without building the model, which is useful on machines without the CUDA
   rasterizer extension.
@@ -450,11 +496,42 @@ python scripts/inference_nuscenes_wide.py \
   at JPEG quality 95. With `--save-inputs` the resized context images are also
   written to `<output-dir>/<scene>/inputs/{frame}_{cam}.jpg`.
 
+### Extrinsics source
+
+Each context camera needs an OpenCV **camera-to-world** `4x4` matrix, and the
+processed scene folders ship two candidates:
+
+| File | Meaning |
+| --- | --- |
+| `cam2ego_extrinsics/{cam}.txt` | static per-camera rig transform (camera → ego) |
+| `extrinsics/{frame}_{cam}.txt` | per-frame global camera-to-world (ego pose baked in) |
+
+`--extrinsics-source` selects which one is used:
+
+- `cam2ego` (**default**) reads `cam2ego_extrinsics/{cam}.txt` and uses it
+  directly as OpenCV camera-to-world. In this processed data the per-frame ego
+  frame **is** the world, so the rig is frame-independent: every frame of a scene
+  reconstructs in the same ego/world frame, which is what independent
+  single-frame processing should do.
+- `per_frame` reads the per-frame `extrinsics/{frame}_{cam}.txt` global matrix
+  instead. That source is not always exactly `ego_pose @ cam2ego` in this
+  processed data (for example, scene `037` frame `008`: the relative
+  camera-3-to-camera-5 transform implied by `per_frame` differs from the
+  `ego_pose @ cam2ego` composition by ~`0.7 m`), so it can yield a
+  frame-dependent rig and a slightly different reconstruction. It is provided
+  **only for explicit A/B comparison**, never as a silent fallback, and the
+  script prints a warning when it is selected.
+
+If the selected file is missing the run fails with an error naming the missing
+path, the active source, and the flag to switch to the other source; the two
+sources are never mixed implicitly.
+
 ### Checkpoints and input resolutions
 
-The resolution preset selects the matching locally shipped base checkpoint:
+The `--model` preset selects the matching locally shipped base checkpoint and
+its architecture; `--input-size` chooses the input resize independently:
 
-| `--resolution` | Default checkpoint | Input | Output (factor 2) | `gaussian_scale_max` |
+| `--model` (alias `--resolution`) | Default checkpoint | Default input | Output (factor 2) | `gaussian_scale_max` |
 | --- | --- | --- | --- | --- |
 | `448x768` (default) | `pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth` | 448x768 | 448x1536 | 0.1 |
 | `256x448` | `pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth` | 256x448 | 256x896 | 3.0 |
@@ -468,7 +545,11 @@ with `0.1`, the `256x448` dl3dv model with the `3.0` default); use
 `--gaussian-scale-max` to override it. Use `--checkpoint` to load another
 compatible checkpoint; the encoder architecture is loaded strictly, so a
 mismatched checkpoint fails loudly (missing *or* unexpected keys) instead of
-silently leaving parts of the encoder randomly initialized.
+silently leaving parts of the encoder randomly initialized. As an early guard,
+passing one preset's *own* checkpoint file together with a different `--model`
+(e.g. `--model 256x448 --checkpoint
+pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth`) is
+rejected before the model is built.
 
 ### Offline DINOv2 requirement
 

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Standalone single-frame nuScenes wide-view inference for DepthSplat.
+"""Standalone nuScenes wide-view inference for DepthSplat.
 
-This script does **not** go through ``ModelWrapper.test_step``.  It loads one
-nuScenes frame, builds the DepthSplat encoder/decoder directly from the
-repository configuration, reconstructs Gaussians from cameras ``[5, 4, 3]`` and
-renders a horizontally widened image from camera ``5``.
+This script does **not** go through ``ModelWrapper.test_step``.  By default it
+processes every scene in the scene list and every valid frame per scene (use
+``--max-frames`` / ``--scene`` / ``--frame`` to narrow this).  For each selected
+frame it builds the DepthSplat encoder/decoder directly from the repository
+configuration, reconstructs Gaussians from cameras ``[5, 4, 3]`` and renders a
+horizontally widened image from camera ``5``.
 
 Rendering convention
 --------------------
@@ -22,12 +24,23 @@ symmetric field of view.
 
 Input layout (per scene folder)::
 
-    images/{frame}_{cam}.jpg          # e.g. 000_5.jpg
-    intrinsics/{cam}.txt              # 9 values, first four fx fy cx cy
-    extrinsics/{frame}_{cam}.txt      # 4x4 OpenCV camera-to-world
+    images/{frame}_{cam}.jpg              # e.g. 000_5.jpg
+    intrinsics/{cam}.txt                  # 9 values, first four fx fy cx cy
+    cam2ego_extrinsics/{cam}.txt          # static rig 4x4 OpenCV camera-to-ego
+    extrinsics/{frame}_{cam}.txt          # per-frame 4x4 OpenCV global C2W
 
-Only per-frame ``extrinsics/{frame}_{cam}.txt`` are used.  ``cam2ego_extrinsics``
-is never silently substituted when the per-frame file is missing.
+Extrinsics source (``--extrinsics-source``)
+-------------------------------------------
+``cam2ego`` (default) reads the static per-camera rig transform
+``cam2ego_extrinsics/{cam}.txt`` and uses it directly as OpenCV
+camera-to-world: the per-frame ego frame *is* the world here, so the rig is
+frame-independent and every independently processed frame reconstructs in the
+same ego/world frame.  ``per_frame`` instead reads
+``extrinsics/{frame}_{cam}.txt``, a per-frame *global* camera-to-world matrix
+(ego pose baked in).  That global source is not always exactly
+``ego_pose @ cam2ego`` in this processed data, so it can yield a frame-dependent
+rig and a slightly different reconstruction; it is offered only for explicit A/B
+comparison and is never used as a silent fallback.
 
 Output layout::
 
@@ -45,6 +58,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 import numpy as np
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Constants (no workstation-specific paths)
@@ -59,11 +73,21 @@ if str(REPO_ROOT) not in sys.path:
 
 DEFAULT_DATA_ROOT = Path("datasets/nuscenes/processed_10Hz/trainval2")
 DEFAULT_SCENE_LIST_NAME = "nuScenes_Val2.txt"
+DEFAULT_SCENE_LIST_PATH = DEFAULT_DATA_ROOT / DEFAULT_SCENE_LIST_NAME
+DEFAULT_MAX_FRAMES = -1  # -1 == process every valid frame of every selected scene
 DEFAULT_OUTPUT_DIR = Path("outputs/nuscenes_wide")
 
 DEFAULT_CAMERAS = (5, 4, 3)
 DEFAULT_RENDER_CAMERA = 5
 DEFAULT_WIDTH_FACTOR = 2.0
+
+# How OpenCV camera-to-world extrinsics are obtained.  ``cam2ego`` reads the
+# static per-camera rig transform ``cam2ego_extrinsics/{cam}.txt`` (ego is the
+# per-frame world), so reconstruction is frame-independent.  ``per_frame`` reads
+# the per-frame global ``extrinsics/{frame}_{cam}.txt`` and exists only for
+# explicit A/B comparison of this processed data.
+DEFAULT_EXTRINSICS_SOURCE = "cam2ego"
+EXTRINSICS_SOURCE_CHOICES = ("cam2ego", "per_frame")
 
 # The dl3dv experiment applies a patch shim of ``shim_patch_size`` at a
 # ``downscale_factor`` stride, so images must be a multiple of the *effective*
@@ -457,13 +481,41 @@ def save_rgb(tensor_chw, path: Path, quality: int = 95) -> None:
 # ---------------------------------------------------------------------------
 
 
+def parse_hw(text: str) -> tuple[int, int]:
+    """Parse an ``HxW`` input size (also accepts ``H,W`` / ``H W``).
+
+    Used for ``--input-size``.  Raises ``argparse.ArgumentTypeError`` so a bad
+    value is reported by argparse as a normal usage error rather than a
+    traceback.
+    """
+    tokens = (
+        str(text).strip().lower().replace("x", " ").replace(",", " ").split()
+    )
+    if len(tokens) != 2:
+        raise argparse.ArgumentTypeError(
+            f"Expected an input size like 448x768, got {text!r}."
+        )
+    try:
+        height, width = int(tokens[0]), int(tokens[1])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"Input size {text!r} must be two integers like 448x768."
+        ) from error
+    if height <= 0 or width <= 0:
+        raise argparse.ArgumentTypeError(
+            f"Input size must be positive, got {height}x{width}."
+        )
+    return (height, width)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inference_nuscenes_wide.py",
         description=(
-            "Single-frame nuScenes wide-view rendering with DepthSplat. "
-            "Reconstructs Gaussians from cameras 5,4,3 and renders a widened "
-            "image from camera 5 (default 2x width, same height)."
+            "nuScenes wide-view rendering with DepthSplat. Reconstructs "
+            "Gaussians from cameras 5,4,3 and renders a widened image from "
+            "camera 5 (default 2x width, same height). By default every scene "
+            "in the scene list and every valid frame per scene is processed."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -475,9 +527,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     data.add_argument(
         "--scene-list",
-        default=None,
+        default=str(DEFAULT_SCENE_LIST_PATH),
         help=(
-            "Scene id list. Defaults to <data-root>/" + DEFAULT_SCENE_LIST_NAME + "."
+            "Scene id list (one scene id per line). Defaults to "
+            "<data-root>/" + DEFAULT_SCENE_LIST_NAME + ", i.e. "
+            f"{DEFAULT_SCENE_LIST_PATH}. Every scene in the list is processed."
         ),
     )
     data.add_argument(
@@ -493,38 +547,81 @@ def build_arg_parser() -> argparse.ArgumentParser:
     data.add_argument(
         "--max-frames",
         type=int,
-        default=1,
-        help="Maximum frames per scene; -1 processes all frames.",
+        default=DEFAULT_MAX_FRAMES,
+        help=(
+            "Maximum valid frames per scene; -1 (default) processes every valid "
+            "frame of every selected scene."
+        ),
     )
     data.add_argument(
         "--cameras",
         default=",".join(str(c) for c in DEFAULT_CAMERAS),
         help="Comma separated context camera ids (order preserved).",
     )
+    data.add_argument(
+        "--extrinsics-source",
+        choices=EXTRINSICS_SOURCE_CHOICES,
+        default=DEFAULT_EXTRINSICS_SOURCE,
+        help=(
+            "OpenCV camera-to-world extrinsics to use. 'cam2ego' (default) "
+            "reads the static per-camera rig transform "
+            "cam2ego_extrinsics/{cam}.txt directly (the per-frame ego frame is "
+            "the world), giving frame-independent reconstruction. 'per_frame' "
+            "reads the per-frame global extrinsics/{frame}_{cam}.txt (ego pose "
+            "baked in), which can be inconsistent in this processed data; it is "
+            "for explicit A/B comparison only."
+        ),
+    )
 
     model = parser.add_argument_group("model")
     model.add_argument(
+        "--model",
         "--resolution",
+        dest="model",
         choices=sorted(MODEL_PRESETS),
         default=DEFAULT_PRESET,
-        help="Model input resolution preset; selects the matching default checkpoint.",
+        help=(
+            "Model architecture preset; selects vitb/num_scales/upsample_factor/"
+            "gaussian_scale_max and the matching default checkpoint. "
+            "--resolution is a legacy alias for --model."
+        ),
+    )
+    model.add_argument(
+        "--input-size",
+        type=parse_hw,
+        metavar="HxW",
+        default=None,
+        help=(
+            "Input resize size as HxW (e.g. 448x768; also H,W or H W). Defaults "
+            "to the --model preset size; rounded down to a multiple of the "
+            "effective patch size. --height/--width override it per dimension."
+        ),
     )
     model.add_argument(
         "--checkpoint",
         default=None,
-        help="Checkpoint path (defaults to the one matching --resolution).",
+        help=(
+            "Checkpoint path (defaults to the one matching --model). It must be "
+            "built for the --model architecture or strict loading fails loudly."
+        ),
     )
     model.add_argument(
         "--height",
         type=int,
         default=None,
-        help="Override the preset input height (floored to the effective patch size).",
+        help=(
+            "Override the input height (highest priority; floored to the "
+            "effective patch size)."
+        ),
     )
     model.add_argument(
         "--width",
         type=int,
         default=None,
-        help="Override the preset input width (floored to the effective patch size).",
+        help=(
+            "Override the input width (highest priority; floored to the "
+            "effective patch size)."
+        ),
     )
     model.add_argument(
         "--gaussian-scale-max",
@@ -573,7 +670,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     out.add_argument(
         "--save-inputs",
         action="store_true",
-        help="Also save the resized context images under <output>/<scene>/inputs/.",
+        help=(
+            "Also save the resized context images under <output>/<scene>/inputs/ "
+            "(disabled by default)."
+        ),
     )
     out.add_argument(
         "--dry-run",
@@ -607,6 +707,45 @@ def parse_cameras(text: str) -> tuple[int, ...]:
 def resolve_local(path: str, base: Path = REPO_ROOT) -> Path:
     p = Path(path).expanduser()
     return p if p.is_absolute() else (base / p)
+
+
+def resolve_input_hw(args, preset: ModelPreset) -> tuple[int, int]:
+    """Resolve the requested input resize size for a parsed ``args``.
+
+    Precedence (lowest to highest): the ``--model`` preset size, then
+    ``--input-size`` for both dimensions, then ``--height`` / ``--width`` for
+    their individual dimension.  The result is the *requested* size; callers
+    still floor it to the effective patch size.
+    """
+    height, width = int(preset.height), int(preset.width)
+    if args.input_size is not None:
+        height, width = int(args.input_size[0]), int(args.input_size[1])
+    if args.height is not None:
+        height = int(args.height)
+    if args.width is not None:
+        width = int(args.width)
+    return (height, width)
+
+
+def validate_checkpoint_preset(checkpoint_path: Path, preset_name: str) -> None:
+    """Reject a ``--checkpoint`` that is another preset's known checkpoint.
+
+    A custom checkpoint is allowed (its architecture is confirmed by the strict
+    load in :func:`load_encoder_state_dict`), but shipping a preset's file under
+    the wrong ``--model`` is a definite mistake that can be reported before
+    building the model.  Arbitrary filenames are left to the strict load.
+    """
+    resolved = Path(checkpoint_path).resolve()
+    for name, preset in MODEL_PRESETS.items():
+        if name == preset_name:
+            continue
+        if resolved == resolve_local(preset.checkpoint).resolve():
+            raise SystemExit(
+                f"--checkpoint {checkpoint_path} is the '{name}' preset "
+                f"checkpoint but --model is '{preset_name}'. Use "
+                f"--model {name} (optionally with --input-size) instead, or "
+                f"pass a checkpoint built for the '{preset_name}' architecture."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -659,18 +798,19 @@ def load_encoder_state_dict(encoder, encoder_state: dict) -> None:
 
     The released checkpoints are full-model ``state_dict``s; the caller passes
     only the ``encoder.*`` entries with that prefix stripped.  A missing or
-    unexpected key means ``--resolution`` / ``--checkpoint`` do not describe the
-    same architecture, so there is deliberately no ``strict=False`` fallback: it
-    would silently leave parts of the encoder randomly initialized (or report a
+    unexpected key means ``--model`` / ``--checkpoint`` do not describe the same
+    architecture, so there is deliberately no ``strict=False`` fallback: it would
+    silently leave parts of the encoder randomly initialized (or report a
     "load" that never happened).  Any mismatch is surfaced as a clear error.
     """
     try:
         encoder.load_state_dict(encoder_state, strict=True)
     except RuntimeError as error:  # pragma: no cover - checkpoint dependent
         raise SystemExit(
-            "Failed to load encoder weights strictly: the checkpoint does not "
-            "match the constructed encoder architecture. Ensure --resolution "
-            "and --checkpoint refer to the same model.\n"
+            "Failed to load encoder weights strictly: --checkpoint does not "
+            "match the architecture selected by --model. A custom checkpoint "
+            "must be built for the chosen --model preset (vitb / num_scales / "
+            "upsample_factor / gaussian_scale_max).\n"
             f"Original error: {error}"
         ) from error
 
@@ -754,6 +894,30 @@ class FrameInputs:
     render_intrinsics_px: PixelIntrinsics  # render camera's resized pixel K
 
 
+def resolve_extrinsics_path(
+    scene_dir: Path,
+    frame: str,
+    cam: int,
+    source: str = DEFAULT_EXTRINSICS_SOURCE,
+) -> Path:
+    """Return the extrinsics file for one camera under the selected source.
+
+    ``cam2ego`` (default) is the static per-camera rig transform
+    ``cam2ego_extrinsics/{cam}.txt``, used directly as OpenCV camera-to-world.
+    ``per_frame`` is the per-frame global camera-to-world matrix
+    ``extrinsics/{frame}_{cam}.txt`` (ego pose baked in), offered only for
+    explicit A/B comparison; it is never selected implicitly.
+    """
+    if source == "cam2ego":
+        return Path(scene_dir) / "cam2ego_extrinsics" / f"{cam}.txt"
+    if source == "per_frame":
+        return Path(scene_dir) / "extrinsics" / f"{frame}_{cam}.txt"
+    raise ValueError(
+        f"Unknown extrinsics source {source!r}; expected one of "
+        f"{EXTRINSICS_SOURCE_CHOICES}."
+    )
+
+
 def load_frame_inputs(
     scene_dir: Path,
     scene: str,
@@ -762,7 +926,16 @@ def load_frame_inputs(
     render_camera: int,
     src_hw: tuple[int, int],
     dst_hw: tuple[int, int],
+    extrinsics_source: str = DEFAULT_EXTRINSICS_SOURCE,
 ) -> FrameInputs:
+    """Load one frame's context images/intrinsics/extrinsics.
+
+    ``extrinsics_source`` selects the camera-to-world source (see
+    :func:`resolve_extrinsics_path`): ``"cam2ego"`` (default) reads the static
+    rig ``cam2ego_extrinsics/{cam}.txt``, ``"per_frame"`` reads the per-frame
+    global ``extrinsics/{frame}_{cam}.txt``.  The chosen source is never
+    silently substituted by the other one.
+    """
     plan = plan_resize_and_crop(src_hw, dst_hw)
     images: list[np.ndarray] = []
     intrinsics: list[np.ndarray] = []
@@ -773,16 +946,29 @@ def load_frame_inputs(
     for index, cam in enumerate(cameras):
         image_path = scene_dir / "images" / f"{frame}_{cam}.jpg"
         intrinsics_path = scene_dir / "intrinsics" / f"{cam}.txt"
-        extrinsics_path = scene_dir / "extrinsics" / f"{frame}_{cam}.txt"
+        extrinsics_path = resolve_extrinsics_path(
+            scene_dir, frame, cam, extrinsics_source
+        )
 
         if not image_path.is_file():
             raise FileNotFoundError(f"Missing image: {image_path}")
         if not intrinsics_path.is_file():
             raise FileNotFoundError(f"Missing intrinsics: {intrinsics_path}")
         if not extrinsics_path.is_file():
+            if extrinsics_source == "cam2ego":
+                raise FileNotFoundError(
+                    f"Missing cam2ego extrinsics: {extrinsics_path}. The "
+                    "default --extrinsics-source cam2ego expects the static rig "
+                    "transform cam2ego_extrinsics/<cam>.txt; pass "
+                    "--extrinsics-source per_frame to read the per-frame "
+                    "extrinsics/<frame>_<cam>.txt instead."
+                )
             raise FileNotFoundError(
-                "Missing per-frame extrinsics: "
-                f"{extrinsics_path} (cam2ego_extrinsics is not used as a silent fallback)"
+                f"Missing per-frame extrinsics: {extrinsics_path}. "
+                "--extrinsics-source per_frame expects "
+                "extrinsics/<frame>_<cam>.txt; the default --extrinsics-source "
+                "cam2ego reads the static rig cam2ego_extrinsics/<cam>.txt "
+                "instead."
             )
 
         pixel_k = read_pixel_intrinsics(intrinsics_path)
@@ -885,11 +1071,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     torch.set_float32_matmul_precision("high")
 
     data_root = resolve_local(args.data_root)
-    scene_list = (
-        resolve_local(args.scene_list)
-        if args.scene_list is not None
-        else data_root / DEFAULT_SCENE_LIST_NAME
-    )
+    # The parser's scene-list default is the canonical trainval2 list.  Keep it
+    # relative to --data-root so overriding only --data-root still picks up that
+    # root's <data-root>/nuScenes_Val2.txt; an explicit --scene-list wins.
+    if args.scene_list == str(DEFAULT_SCENE_LIST_PATH):
+        scene_list = data_root / DEFAULT_SCENE_LIST_NAME
+    else:
+        scene_list = resolve_local(args.scene_list)
     output_dir = resolve_local(args.output_dir)
     cameras = parse_cameras(args.cameras)
 
@@ -903,6 +1091,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
 
+    # Extrinsics provenance is part of the result: report it explicitly and warn
+    # when the A/B-only per-frame global source is requested.
+    if args.extrinsics_source == "per_frame":
+        print(
+            "[warn] --extrinsics-source per_frame uses the per-frame global "
+            "cam-to-world extrinsics/<frame>_<cam>.txt (ego pose baked in); "
+            "this can be inconsistent in the processed data. The default "
+            "cam2ego static rig is recommended for frame-independent "
+            "reconstruction.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[info] Using --extrinsics-source cam2ego: static per-camera rig "
+            "transforms cam2ego_extrinsics/<cam>.txt as OpenCV camera-to-world.",
+            file=sys.stderr,
+        )
+
     if args.scene is not None:
         scenes = [args.scene]
     else:
@@ -912,9 +1118,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not scenes:
         raise SystemExit(f"No scenes selected (scene list: {scene_list}).")
 
-    preset = MODEL_PRESETS[args.resolution]
-    preset_height = args.height if args.height is not None else preset.height
-    preset_width = args.width if args.width is not None else preset.width
+    preset = MODEL_PRESETS[args.model]
+    requested_hw = resolve_input_hw(args, preset)
 
     # DINOv2 must resolve to a valid local source for real inference: this path
     # deliberately has no network fallback. ``--dry-run`` never builds a model,
@@ -927,6 +1132,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dinov2_source = None
 
     # Compose config early (cheap, no torch) so the effective patch size is explicit.
+    # ``--model`` alone controls the architecture (vitb/num_scales/upsample_factor/
+    # gaussian_scale_max); ``--input-size`` only sets the resize target.
     cfg_dict = compose_config_dict(args, preset, dinov2_source)
     patch_size = effective_patch_size(cfg_dict)
     if patch_size != FALLBACK_EFFECTIVE_PATCH_SIZE:
@@ -934,10 +1141,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"[info] Using effective patch size {patch_size} from the composed config.",
             file=sys.stderr,
         )
-    dst_hw = round_hw_to_multiple((int(preset_height), int(preset_width)), patch_size)
-    if dst_hw != (int(preset_height), int(preset_width)):
+    dst_hw = round_hw_to_multiple(requested_hw, patch_size)
+    if dst_hw != requested_hw:
         print(
-            f"[info] Input resolution {preset_height}x{preset_width} rounded to "
+            f"[info] Input size {requested_hw[0]}x{requested_hw[1]} rounded to "
             f"{dst_hw[0]}x{dst_hw[1]} (multiple of effective patch {patch_size}).",
             file=sys.stderr,
         )
@@ -947,6 +1154,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.checkpoint is not None
         else resolve_local(preset.checkpoint)
     )
+    if args.checkpoint is not None:
+        validate_checkpoint_preset(checkpoint_path, args.model)
+        print(
+            f"[info] Using custom --checkpoint {checkpoint_path} with --model "
+            f"'{args.model}' architecture; a mismatch fails at strict load.",
+            file=sys.stderr,
+        )
 
     # Enumerate and validate jobs before touching the GPU/model.
     jobs: list[tuple[str, str]] = []
@@ -975,7 +1189,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print(
         f"Selected {len(jobs)} frame(s) from {len(scenes)} scene(s); "
-        f"input {dst_hw[0]}x{dst_hw[1]}, effective patch {patch_size}."
+        f"model '{args.model}', input {dst_hw[0]}x{dst_hw[1]}, "
+        f"effective patch {patch_size}."
     )
 
     # Determine source resolution from the first valid image and validate.
@@ -987,25 +1202,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"Source image resolution: {src_hw[0]}x{src_hw[1]}")
 
     if args.dry_run:
-        for scene, frame in jobs:
-            inputs = load_frame_inputs(
-                data_root / scene,
-                scene,
-                frame,
-                cameras,
-                args.render_camera,
-                src_hw,
-                dst_hw,
-            )
-            wide_px, out_hw = make_wide_intrinsics(
-                inputs.render_intrinsics_px, (dst_hw[0], dst_hw[1]), args.width_factor
-            )
-            print(
-                f"[dry-run] scene={scene} frame={frame} "
-                f"images={inputs.images.shape} extrinsics={inputs.extrinsics.shape} "
-                f"K_norm={inputs.intrinsics.shape} wide={out_hw[0]}x{out_hw[1]} "
-                f"wide_K_px=({wide_px.fx:.2f},{wide_px.fy:.2f},{wide_px.cx:.2f},{wide_px.cy:.2f})"
-            )
+        with tqdm(
+            jobs, total=len(jobs), unit="frame", desc="Validating frames (dry-run)"
+        ) as progress:
+            for index, (scene, frame) in enumerate(progress):
+                inputs = load_frame_inputs(
+                    data_root / scene,
+                    scene,
+                    frame,
+                    cameras,
+                    args.render_camera,
+                    src_hw,
+                    dst_hw,
+                    extrinsics_source=args.extrinsics_source,
+                )
+                wide_px, out_hw = make_wide_intrinsics(
+                    inputs.render_intrinsics_px,
+                    (dst_hw[0], dst_hw[1]),
+                    args.width_factor,
+                )
+                progress.set_postfix(
+                    scene=scene, frame=frame, wide=f"{out_hw[0]}x{out_hw[1]}"
+                )
+                # Keep one concrete diagnostic line instead of one per frame so a
+                # failure can still be traced without flooding the terminal.
+                if index == 0:
+                    progress.write(
+                        f"[dry-run] first frame scene={scene} frame={frame} "
+                        f"extrinsics_source={args.extrinsics_source} "
+                        f"images={inputs.images.shape} "
+                        f"extrinsics={inputs.extrinsics.shape} "
+                        f"K_norm={inputs.intrinsics.shape} "
+                        f"wide={out_hw[0]}x{out_hw[1]} "
+                        f"wide_K_px=({wide_px.fx:.2f},{wide_px.fy:.2f},"
+                        f"{wide_px.cx:.2f},{wide_px.cy:.2f})"
+                    )
         return 0
 
     device = torch.device(
@@ -1021,32 +1252,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _, encoder, decoder = build_model(cfg_dict, checkpoint_path, device)
 
     render_index = list(cameras).index(args.render_camera)
-    for scene, frame in jobs:
-        scene_dir = data_root / scene
-        inputs = load_frame_inputs(
-            scene_dir, scene, frame, cameras, args.render_camera, src_hw, dst_hw
-        )
-        color, (out_h, out_w) = _render_wide_impl(
-            inputs,
-            encoder,
-            decoder,
-            render_index,
-            args.width_factor,
-            args.near,
-            args.far,
-            device,
-            args.amp,
-        )
-        save_path = output_dir / scene / "rgb" / f"{frame}_{args.render_camera}_wide.jpg"
-        save_rgb(color, save_path, quality=95)
-        print(f"Saved {save_path} ({out_w}x{out_h})")
+    progress = tqdm(
+        jobs,
+        total=len(jobs),
+        unit="frame",
+        desc="Rendering wide views",
+    )
+    try:
+        for scene, frame in progress:
+            progress.set_postfix(scene=scene, frame=frame)
+            scene_dir = data_root / scene
+            inputs = load_frame_inputs(
+                scene_dir,
+                scene,
+                frame,
+                cameras,
+                args.render_camera,
+                src_hw,
+                dst_hw,
+                extrinsics_source=args.extrinsics_source,
+            )
+            color, (out_h, out_w) = _render_wide_impl(
+                inputs,
+                encoder,
+                decoder,
+                render_index,
+                args.width_factor,
+                args.near,
+                args.far,
+                device,
+                args.amp,
+            )
+            progress.set_postfix(
+                scene=scene, frame=frame, out=f"{out_h}x{out_w}"
+            )
+            save_path = (
+                output_dir / scene / "rgb" / f"{frame}_{args.render_camera}_wide.jpg"
+            )
+            save_rgb(color, save_path, quality=95)
 
-        if args.save_inputs:
-            for cam, image in zip(cameras, inputs.images):
-                input_path = output_dir / scene / "inputs" / f"{frame}_{cam}.jpg"
-                save_rgb(
-                    torch.from_numpy(image).permute(2, 0, 1), input_path, quality=95
-                )
+            if args.save_inputs:
+                for cam, image in zip(cameras, inputs.images):
+                    input_path = output_dir / scene / "inputs" / f"{frame}_{cam}.jpg"
+                    save_rgb(
+                        torch.from_numpy(image).permute(2, 0, 1), input_path, quality=95
+                    )
+    finally:
+        # Close cleanly on errors so the traceback stays readable.
+        progress.close()
 
     return 0
 
