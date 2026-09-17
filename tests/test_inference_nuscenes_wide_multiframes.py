@@ -12,11 +12,13 @@ require CUDA or the Gaussian rasterizer.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -278,6 +280,26 @@ class ParserDefaultsTest(unittest.TestCase):
         self.assertIsNone(self.args.local_mv_match)
         self.assertIsNone(mf.DEFAULT_LOCAL_MV_MATCH)
 
+    def test_car_mask_defaults_enabled(self):
+        # Masking is on by default: car-mask-root has its default and the
+        # disable flag is off.
+        self.assertEqual(
+            self.args.car_mask_root,
+            "datasets/nuscenes/processed_10Hz/nuscenes_mask",
+        )
+        self.assertFalse(self.args.disable_car_mask)
+
+    def test_disable_car_mask_flag(self):
+        args = mf.build_arg_parser().parse_args(["--disable-car-mask"])
+        self.assertTrue(args.disable_car_mask)
+
+    def test_car_mask_root_override(self):
+        args = mf.build_arg_parser().parse_args(
+            ["--car-mask-root", "/some/other/masks"]
+        )
+        self.assertEqual(args.car_mask_root, "/some/other/masks")
+        self.assertFalse(args.disable_car_mask)
+
     def test_output_defaults(self):
         self.assertEqual(
             self.args.output_dir, "outputs/nuscenes_wide_multiframes"
@@ -471,6 +493,396 @@ class LoadWindowInputsTest(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 self._load(scene_dir)
+
+
+class CameraMaskMappingTest(unittest.TestCase):
+    """The nuScenes camera id -> mask file mapping is exact."""
+
+    EXPECTED = {
+        0: "CAM_FRONT_mask.png",
+        1: "CAM_FRONT_LEFT_mask.png",
+        2: "CAM_FRONT_RIGHT_mask.png",
+        3: "CAM_BACK_LEFT_mask.png",
+        4: "CAM_BACK_RIGHT_mask.png",
+        5: "CAM_BACK_mask.png",
+    }
+
+    def test_camera_to_file_mapping(self):
+        self.assertEqual(mf.CAMERA_MASK_FILES, self.EXPECTED)
+
+    def test_default_root(self):
+        self.assertEqual(
+            mf.DEFAULT_CAR_MASK_ROOT,
+            Path("datasets/nuscenes/processed_10Hz/nuscenes_mask"),
+        )
+
+    def test_paths_use_camera_names(self):
+        root = Path("/masks")
+        for cam, name in self.EXPECTED.items():
+            with self.subTest(cam=cam):
+                self.assertEqual(mf.camera_mask_path(root, cam), root / name)
+
+    def test_unmapped_camera_is_a_hard_error(self):
+        with self.assertRaises(KeyError):
+            mf.camera_mask_path(Path("/masks"), 6)
+
+
+class CarMaskResizeTest(unittest.TestCase):
+    """Masks follow the exact image resize/crop plan, never a plain resize."""
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:  # pragma: no cover - environment dependent
+            self.skipTest("PIL is required to write temporary mask images")
+
+    @staticmethod
+    def _checkerboard(h, w):
+        y, x = np.indices((h, w))
+        return np.where((x + y) % 2 == 0, 255, 0).astype(np.uint8)
+
+    def test_nearest_resize_then_centre_crop(self):
+        from PIL import Image
+
+        plan = mf.wide.plan_resize_and_crop((4, 8), (8, 4))
+        source = self._checkerboard(4, 8)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "CAM_BACK_mask.png"
+            Image.fromarray(source, "L").save(path)
+
+            got = mf.load_resized_keep_mask(path, plan)
+
+            # Reference: NEAREST resize to the scaled size, then the centre crop.
+            image = Image.open(path).convert("L")
+            image = image.resize((plan.scaled_w, plan.scaled_h), Image.NEAREST)
+            image = image.crop(
+                (plan.col, plan.row, plan.col + plan.out_w, plan.row + plan.out_h)
+            )
+            expected = np.asarray(image) >= mf.CAR_MASK_KEEP_THRESHOLD
+            np.testing.assert_array_equal(got, expected)
+            self.assertEqual(got.shape, (plan.out_h, plan.out_w))
+
+            # A plain resize straight to the destination gives a different
+            # alignment; the helper must not do that.
+            direct = np.asarray(
+                Image.open(path).convert("L").resize(
+                    (plan.out_w, plan.out_h), Image.NEAREST
+                )
+            ) >= mf.CAR_MASK_KEEP_THRESHOLD
+            self.assertFalse(np.array_equal(got, direct))
+
+    def test_polarity_black_removed_white_kept(self):
+        from PIL import Image
+
+        plan = mf.wide.plan_resize_and_crop((2, 2), (2, 2))
+        source = np.array([[0, 127], [128, 255]], dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.png"
+            Image.fromarray(source, "L").save(path)
+            got = mf.load_resized_keep_mask(path, plan)
+            np.testing.assert_array_equal(got, [[False, False], [True, True]])
+
+    def test_source_dimension_mismatch_fails_loudly(self):
+        from PIL import Image
+
+        plan = mf.wide.plan_resize_and_crop((4, 8), (8, 4))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.png"
+            Image.fromarray(self._checkerboard(2, 2), "L").save(path)
+            with self.assertRaises(ValueError) as ctx:
+                mf.load_resized_keep_mask(path, plan)
+            message = str(ctx.exception)
+            self.assertIn("4x8", message)
+            self.assertIn("resolution", message)
+
+
+class HistoryOnlyMaskTest(unittest.TestCase):
+    """Historical views use their camera mask; the newest frame keeps all."""
+
+    def _masks(self, h=2, w=2):
+        zeros = np.zeros((h, w), dtype=bool)
+        ones = np.ones((h, w), dtype=bool)
+        return {
+            5: np.full((h, w), True, dtype=bool),
+            4: np.full((h, w), False, dtype=bool),
+            3: np.array([[True, False], [False, True]]) if (h, w) == (2, 2) else zeros,
+        }
+
+    def test_each_camera_applied_to_history_newest_all_kept(self):
+        cameras = (5, 4, 3)
+        keep = mf.build_history_only_keep_mask(
+            self._masks(), cameras, num_frames=3, dst_hw=(2, 2)
+        )
+        self.assertEqual(keep.shape, (9, 2, 2))
+        self.assertTrue(keep.dtype == bool)
+
+        # Frame-major: [t0 c5, t0 c4, t0 c3, t1 c5, t1 c4, t1 c3, t2 (newest) ...]
+        np.testing.assert_array_equal(keep[0], self._masks()[5])
+        np.testing.assert_array_equal(keep[1], self._masks()[4])
+        np.testing.assert_array_equal(keep[2], self._masks()[3])
+        np.testing.assert_array_equal(keep[3], self._masks()[5])
+        np.testing.assert_array_equal(keep[4], self._masks()[4])
+        np.testing.assert_array_equal(keep[5], self._masks()[3])
+        # Newest frame keeps every pixel for all cameras.
+        self.assertTrue(keep[6:9].all())
+
+    def test_single_frame_keeps_everything(self):
+        cameras = (5, 4, 3)
+        keep = mf.build_history_only_keep_mask(
+            self._masks(), cameras, num_frames=1, dst_hw=(2, 2)
+        )
+        self.assertEqual(keep.shape, (3, 2, 2))
+        self.assertTrue(keep.all())
+
+
+class GaussianPruningTest(unittest.TestCase):
+    """Multiplicity inference and synchronized Gaussian pruning."""
+
+    @dataclasses.dataclass
+    class _Gaussians:
+        means: object
+        covariances: object
+        harmonics: object
+        opacities: object
+
+    def setUp(self):
+        try:
+            import torch  # noqa: F401
+        except ImportError:  # pragma: no cover - environment dependent
+            self.skipTest("torch is required to build Gaussian test tensors")
+
+    def _make(self, v, h, w, k):
+        import torch
+
+        base = v * h * w
+        g = base * k
+        idx = torch.arange(g, dtype=torch.float32)
+        return self._Gaussians(
+            means=idx.view(1, g, 1).repeat(1, 1, 3),
+            covariances=idx.view(1, g, 1, 1).repeat(1, 1, 3, 3),
+            harmonics=idx.view(1, g, 1, 1).repeat(1, 1, 3, 2),
+            opacities=idx.view(1, g),
+        )
+
+    def test_expand_keep_mask_over_multiplicity(self):
+        keep = np.array(
+            [[[True, False], [True, True]], [[False, False], [True, False]]]
+        )
+        flat = mf.expand_keep_mask_to_gaussians(keep, 2)
+        expected = np.repeat(keep.reshape(-1), 2)
+        np.testing.assert_array_equal(flat, expected)
+        self.assertEqual(flat.shape, (2 * 4 * 2,))
+
+    def test_multiplicity_is_inferred_and_all_fields_pruned(self):
+        # V=2, H=2, W=2, K=3 -> G = 24 > V*H*W = 8.
+        v, h, w, k = 2, 2, 2, 3
+        gaussians = self._make(v, h, w, k)
+        keep_mask = np.array(
+            [[[True, False], [True, True]], [[False, False], [True, False]]]
+        )
+        pruned = mf.filter_gaussians_by_camera_mask(
+            gaussians, keep_mask, v, h, w
+        )
+        flat = np.repeat(keep_mask.reshape(-1), k)
+        expected_index = np.nonzero(flat)[0]
+        self.assertEqual(pruned.means.shape[1], expected_index.size)
+        # Every field is sliced identically along dim=1.
+        np.testing.assert_array_equal(
+            pruned.means[0, :, 0].numpy(), expected_index.astype(np.float32)
+        )
+        np.testing.assert_array_equal(
+            pruned.covariances[0, :, 0, 0].numpy(),
+            expected_index.astype(np.float32),
+        )
+        np.testing.assert_array_equal(
+            pruned.harmonics[0, :, 0, 0].numpy(),
+            expected_index.astype(np.float32),
+        )
+        np.testing.assert_array_equal(
+            pruned.opacities[0].numpy(), expected_index.astype(np.float32)
+        )
+        self.assertIsInstance(pruned, type(gaussians))
+
+    def test_indivisible_gaussian_count_fails(self):
+        # G = 3 but V*H*W = 4 does not divide it.
+        gaussians = self._make(v=1, h=2, w=2, k=1)
+        bad = self._Gaussians(
+            means=gaussians.means[:, :3],
+            covariances=gaussians.covariances[:, :3],
+            harmonics=gaussians.harmonics[:, :3],
+            opacities=gaussians.opacities[:, :3],
+        )
+        with self.assertRaises(ValueError) as ctx:
+            mf.filter_gaussians_by_camera_mask(
+                bad, np.ones((1, 2, 2), dtype=bool), 1, 2, 2
+            )
+        self.assertIn("does not divide", str(ctx.exception))
+
+    def test_all_removed_fails_loudly(self):
+        v, h, w, k = 1, 2, 2, 1
+        gaussians = self._make(v, h, w, k)
+        with self.assertRaises(ValueError) as ctx:
+            mf.filter_gaussians_by_camera_mask(
+                gaussians, np.zeros((v, h, w), dtype=bool), v, h, w
+            )
+        self.assertIn("every Gaussian", str(ctx.exception))
+
+    def test_mask_shape_mismatch_fails(self):
+        gaussians = self._make(1, 2, 2, 1)
+        with self.assertRaises(ValueError):
+            mf.filter_gaussians_by_camera_mask(
+                gaussians, np.ones((2, 2, 2), dtype=bool), 1, 2, 2
+            )
+
+
+class MissingMaskTest(unittest.TestCase):
+    """A missing required mask never silently becomes all-ones."""
+
+    def test_missing_mask_raises_with_path(self):
+        root = Path("/nonexistent/mask/root")
+        with self.assertRaises(FileNotFoundError) as ctx:
+            mf.load_camera_keep_masks(
+                root, (5, 4, 3), mf.wide.plan_resize_and_crop((2, 2), (2, 2))
+            )
+        self.assertIn("CAM_BACK_mask.png", str(ctx.exception))
+
+    def test_partial_root_reports_missing_camera(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Image.new("L", (2, 2), 255).save(root / "CAM_BACK_mask.png")
+            Image.new("L", (2, 2), 255).save(root / "CAM_BACK_RIGHT_mask.png")
+            with self.assertRaises(FileNotFoundError) as ctx:
+                mf.load_camera_keep_masks(
+                    root,
+                    (5, 4, 3),
+                    mf.wide.plan_resize_and_crop((2, 2), (2, 2)),
+                )
+            self.assertIn("CAM_BACK_LEFT_mask.png", str(ctx.exception))
+
+    def test_all_present_loads_every_camera(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for cam, name in mf.CAMERA_MASK_FILES.items():
+                Image.new("L", (2, 2), 255).save(root / name)
+            masks = mf.load_camera_keep_masks(
+                root, (5, 4, 3), mf.wide.plan_resize_and_crop((2, 2), (2, 2))
+            )
+            self.assertEqual(set(masks), {5, 4, 3})
+
+
+class RenderFilterCallbackTest(unittest.TestCase):
+    """``_render_wide_impl`` calls the filter between encoder and decoder."""
+
+    @dataclasses.dataclass
+    class _Gaussians:
+        means: object
+        covariances: object
+        harmonics: object
+        opacities: object
+
+    def setUp(self):
+        try:
+            import torch  # noqa: F401
+        except ImportError:  # pragma: no cover - environment dependent
+            self.skipTest("torch is required to exercise the render callback")
+
+    def _inputs(self):
+        cameras = 3
+        h = w = 8
+        return mf.wide.FrameInputs(
+            scene="s",
+            frame="000",
+            images=np.zeros((cameras, h, w, 3), dtype=np.float32),
+            intrinsics=np.tile(np.eye(3, dtype=np.float32), (cameras, 1, 1)),
+            extrinsics=np.tile(np.eye(4, dtype=np.float32), (cameras, 1, 1)),
+            resize_plan=mf.wide.plan_resize_and_crop((h, w), (h, w)),
+            render_intrinsics_px=mf.wide.PixelIntrinsics(4, 4, 4, 4),
+        )
+
+    def _fake_gaussians(self, tag):
+        import torch
+
+        obj = self._Gaussians(
+            means=torch.zeros(1, 3, 3),
+            covariances=torch.zeros(1, 3, 3, 3),
+            harmonics=torch.zeros(1, 3, 3, 1),
+            opacities=torch.zeros(1, 3),
+        )
+        obj.tag = tag
+        return obj
+
+    def test_filter_runs_between_encoder_and_decoder(self):
+        import torch
+
+        raw = self._fake_gaussians("encoded")
+        filtered = self._fake_gaussians("filtered")
+
+        class _Encoder:
+            def __call__(self, context, step, flag):
+                return {"gaussians": raw}
+
+        seen = {}
+
+        class _Decoder:
+            def __call__(self, gaussians, *args, **kwargs):
+                seen["gaussians"] = gaussians
+                return SimpleNamespace(color=torch.zeros(1, 1, 3, 8, 8))
+
+        calls = []
+
+        def callback(gaussians, num_views, height, width):
+            calls.append((gaussians, num_views, height, width))
+            return filtered
+
+        mf.wide._render_wide_impl(
+            self._inputs(),
+            _Encoder(),
+            _Decoder(),
+            0,
+            2.0,
+            0.5,
+            200.0,
+            torch.device("cpu"),
+            False,
+            gaussian_filter=callback,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][0], raw)
+        self.assertEqual(calls[0][1:], (3, 8, 8))
+        self.assertIs(seen["gaussians"], filtered)
+
+    def test_no_filter_leaves_encoder_output_untouched(self):
+        import torch
+
+        raw = self._fake_gaussians("encoded")
+
+        class _Encoder:
+            def __call__(self, context, step, flag):
+                return {"gaussians": raw}
+
+        seen = {}
+
+        class _Decoder:
+            def __call__(self, gaussians, *args, **kwargs):
+                seen["gaussians"] = gaussians
+                return SimpleNamespace(color=torch.zeros(1, 1, 3, 8, 8))
+
+        mf.wide._render_wide_impl(
+            self._inputs(),
+            _Encoder(),
+            _Decoder(),
+            0,
+            2.0,
+            0.5,
+            200.0,
+            torch.device("cpu"),
+            False,
+        )
+        self.assertIs(seen["gaussians"], raw)
 
 
 if __name__ == "__main__":

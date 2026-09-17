@@ -1023,7 +1023,17 @@ def _render_wide_impl(
     far: float,
     device,
     amp: bool,
+    gaussian_filter=None,
 ):
+    """Encode views, optionally filter the Gaussians, then render.
+
+    ``gaussian_filter`` is an optional callback invoked with
+    ``(gaussians, num_views, height, width)`` right after the encoder returns
+    and before the decoder runs; it must return a Gaussians object (e.g. a
+    pruned copy).  It defaults to ``None`` so the single-frame callers are
+    completely unchanged.  The multi-frame script uses it to drop ego-car
+    Gaussians from historical views.
+    """
     import torch
 
     images = torch.from_numpy(frame_inputs.images).permute(0, 3, 1, 2).contiguous()
@@ -1060,6 +1070,8 @@ def _render_wide_impl(
     with torch.no_grad(), autocast:
         encoded = encoder(context, 0, True)
         gaussians = encoded["gaussians"] if isinstance(encoded, dict) else encoded
+        if gaussian_filter is not None:
+            gaussians = gaussian_filter(gaussians, v, context_h, context_w)
         output = decoder(
             gaussians,
             target_extrinsics[None],
