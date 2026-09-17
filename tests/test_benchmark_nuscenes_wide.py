@@ -44,6 +44,9 @@ class ParserDefaultsTest(unittest.TestCase):
 
     def setUp(self):
         self.args = bench.build_arg_parser().parse_args([])
+        # Dataset-derived fields default to None and are filled from the
+        # selected --dataset preset (nuscenes by default).
+        bench.resolve_dataset_defaults(self.args)
 
     def test_mode_and_benchmark_defaults(self):
         self.assertEqual(self.args.mode, "multi")
@@ -69,7 +72,7 @@ class ParserDefaultsTest(unittest.TestCase):
     def test_camera_and_render_defaults(self):
         self.assertEqual(self.args.cameras, "5,4,3")
         self.assertEqual(self.args.render_camera, 5)
-        self.assertEqual(self.args.width_factor, 2.0)
+        self.assertEqual(self.args.width_factor, 3.0)
         self.assertEqual(self.args.near, 0.5)
         self.assertEqual(self.args.far, 200.0)
 
@@ -159,6 +162,56 @@ class ParserDefaultsTest(unittest.TestCase):
             bench.build_arg_parser().parse_args(["--mode", "triple"])
         with self.assertRaises(SystemExit):
             bench.build_arg_parser().parse_args(["--model", "1024x2048"])
+
+    def test_dataset_default_is_nuscenes(self):
+        args = bench.build_arg_parser().parse_args([])
+        self.assertEqual(args.dataset, "nuscenes")
+        self.assertEqual(bench.DEFAULT_DATASET, "nuscenes")
+        bench.resolve_dataset_defaults(args)
+        self.assertEqual(args.data_root, str(bench.DEFAULT_DATA_ROOT))
+        self.assertEqual(
+            args.scene_list, str(bench.DEFAULT_SCENE_LIST_PATH)
+        )
+
+    def test_dataset_overrides_defaults(self):
+        args = bench.build_arg_parser().parse_args(["--dataset", "lyft1920"])
+        bench.resolve_dataset_defaults(args)
+        self.assertEqual(args.data_root, "datasets/lyft/lyft_val1920_3cams")
+        self.assertEqual(
+            args.scene_list,
+            "datasets/lyft/lyft_val1920_3cams/lyft_val1920.txt",
+        )
+        self.assertEqual(
+            args.car_mask_root,
+            "datasets/lyft/lyft_val1920_3cams/ego_car_masks",
+        )
+        self.assertEqual(args.cameras, "5,4,3")
+        self.assertEqual(args.render_camera, 5)
+
+    def test_ddad_dataset_defaults(self):
+        args = bench.build_arg_parser().parse_args(["--dataset", "ddad"])
+        bench.resolve_dataset_defaults(args)
+        self.assertEqual(args.data_root, "datasets/ddad/valid")
+        self.assertEqual(args.car_mask_root, "datasets/ddad/valid")
+
+    def test_parser_rejects_unknown_dataset(self):
+        with self.assertRaises(SystemExit):
+            bench.build_arg_parser().parse_args(["--dataset", "kitti"])
+
+    def test_default_width_factor_is_three(self):
+        self.assertEqual(self.args.width_factor, 3.0)
+        self.assertEqual(bench.DEFAULT_WIDTH_FACTOR, 3.0)
+
+    def test_dataset_derived_input_resolution(self):
+        model = bench.wide.MODEL_PRESETS["256x448"]
+        for dataset, expected in (("ddad", (256, 448)), ("lyft1224", (384, 448))):
+            with self.subTest(dataset=dataset):
+                args = bench.build_arg_parser().parse_args(["--dataset", dataset])
+                preset = bench.resolve_dataset_defaults(args)
+                self.assertEqual(
+                    bench.wide.resolve_dataset_input_hw(args, model, preset, 64),
+                    expected,
+                )
 
     def test_resolution_is_a_model_alias(self):
         args = bench.build_arg_parser().parse_args(["--resolution", "448x768"])

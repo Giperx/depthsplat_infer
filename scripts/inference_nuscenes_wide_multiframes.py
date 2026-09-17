@@ -26,12 +26,16 @@ enumeration per scene *before* windowing (so ``--max-frames 3`` yields only the
 
 Extrinsics
 ----------
-Unlike the single-frame script, multi-frame inference deliberately uses the
-already-computed per-frame **global** camera-to-world matrices from
-``extrinsics/{frame}_{cam}.txt`` directly.  The static ``cam2ego`` rig is *not*
-used and the per-frame ego pose is *not* recomputed: each view in a window keeps
-its own global C2W matrix so the frames stay in a single, consistent world
-frame.  Missing per-frame extrinsics are a hard error (there is no fallback).
+Unlike the single-frame script, multi-frame inference uses the already-computed
+per-frame **global** camera-to-world matrices.  ``--extrinsics-source auto`` (the
+default) follows the ``--dataset`` preset: ``per_frame`` reads
+``extrinsics/{frame}_{cam}.txt`` directly (nuScenes, Lyft); ``compose`` builds
+``ego_pose/{frame}.txt @ cam2ego_extrinsics/{cam}.txt`` (DDAD, which ships no
+``extrinsics/`` directory).  The static ``cam2ego`` rig is *not* used directly
+and the per-frame ego pose is *not* recomputed otherwise.  Missing inputs are a
+hard error (there is no fallback).  ``--dataset
+{nuscenes,lyft1920,lyft1224,ddad}`` also selects paths, cameras and mask naming;
+``nuscenes`` is the default and keeps the previous behaviour.
 
 Input layout (per scene folder)::
 
@@ -156,6 +160,8 @@ ResizeCropPlan = wide.ResizeCropPlan
 # ---------------------------------------------------------------------------
 
 DEFAULT_NUM_FRAMES = 3
+DEFAULT_DATASET = wide.DEFAULT_DATASET
+DATASETS = wide.DATASETS
 DEFAULT_CAMERAS = wide.DEFAULT_CAMERAS  # (5, 4, 3)
 DEFAULT_RENDER_CAMERA = wide.DEFAULT_RENDER_CAMERA  # 5
 DEFAULT_MAX_FRAMES = wide.DEFAULT_MAX_FRAMES  # -1 == all valid frames
@@ -163,9 +169,13 @@ DEFAULT_DATA_ROOT = wide.DEFAULT_DATA_ROOT
 DEFAULT_SCENE_LIST_PATH = wide.DEFAULT_SCENE_LIST_PATH
 DEFAULT_SCENE_LIST_NAME = wide.DEFAULT_SCENE_LIST_NAME
 DEFAULT_WIDTH_FACTOR = wide.DEFAULT_WIDTH_FACTOR
+DEFAULT_MULTI_EXTRINSICS_SOURCE = "auto"
+MULTI_EXTRINSICS_SOURCE_CHOICES = ("auto", "per_frame", "compose")
 # A distinct default output root so a multi-frame run cannot silently overwrite
 # the single-frame run's same-named outputs.
-DEFAULT_OUTPUT_DIR = Path("outputs/nuscenes_wide_multiframes")
+DEFAULT_OUTPUT_DIR = Path(
+    f"outputs/{wide.DATASETS[DEFAULT_DATASET].name}_wide_multiframes"
+)
 
 # The local_mv_match override for a window with V views: V - 1 means "match
 # against every other view" (the encoder keeps local_mv_match + 1 neighbours).
@@ -241,6 +251,65 @@ def per_frame_extrinsics_path(scene_dir: Path, frame: str, cam: int) -> Path:
     return Path(scene_dir) / "extrinsics" / f"{frame}_{cam}.txt"
 
 
+def compose_extrinsics_paths(scene_dir: Path, frame: str, cam: int):
+    """Paths ``(ego_pose, cam2ego)`` whose product is the global C2W matrix."""
+    scene_dir = Path(scene_dir)
+    return (
+        scene_dir / "ego_pose" / f"{frame}.txt",
+        scene_dir / "cam2ego_extrinsics" / f"{cam}.txt",
+    )
+
+
+def read_view_extrinsics(scene_dir: Path, frame: str, cam: int, mode: str):
+    """Read one view's 4x4 OpenCV camera-to-world matrix for ``mode``.
+
+    ``per_frame`` reads ``extrinsics/{frame}_{cam}.txt`` directly.  ``compose``
+    returns ``ego_pose/{frame}.txt @ cam2ego_extrinsics/{cam}.txt`` (required by
+    DDAD, which ships no ``extrinsics/`` directory).  Missing inputs raise a
+    clear ``FileNotFoundError``; an unknown mode raises ``ValueError``.
+    """
+    scene_dir = Path(scene_dir)
+    if mode == "per_frame":
+        path = per_frame_extrinsics_path(scene_dir, frame, cam)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing per-frame global extrinsics: {path}. "
+                "--extrinsics-source per_frame reads "
+                "extrinsics/{frame}_{cam}.txt directly (cam2ego is intentionally "
+                "not used here). Datasets without an extrinsics/ directory (e.g. "
+                "DDAD) need --extrinsics-source compose (or auto)."
+            )
+        return wide.read_matrix(path, size=4)
+    if mode == "compose":
+        ego_path, rig_path = compose_extrinsics_paths(scene_dir, frame, cam)
+        for path in (ego_path, rig_path):
+            if not path.is_file():
+                raise FileNotFoundError(
+                    "Missing extrinsics input for --extrinsics-source compose: "
+                    f"{path}. compose needs both ego_pose/{frame}.txt and "
+                    "cam2ego_extrinsics/{cam}.txt."
+                )
+        ego = wide.read_matrix(ego_path, size=4)
+        rig = wide.read_matrix(rig_path, size=4)
+        return ego @ rig
+    raise ValueError(
+        f"Unknown multi-frame extrinsics mode {mode!r}; expected one of "
+        f"{MULTI_EXTRINSICS_SOURCE_CHOICES}."
+    )
+
+
+def resolve_multi_extrinsics_mode(requested, preset) -> str:
+    """Resolve ``auto`` (default) to the dataset preset's multi-frame source."""
+    if requested in (None, "auto"):
+        return preset.multi_extrinsics
+    if requested not in MULTI_EXTRINSICS_SOURCE_CHOICES:
+        raise SystemExit(
+            f"--extrinsics-source {requested!r} is invalid; expected one of "
+            f"{MULTI_EXTRINSICS_SOURCE_CHOICES}."
+        )
+    return requested
+
+
 def select_windows(
     frames: Sequence[str], num_frames: int, frame: Optional[str] = None
 ) -> list[tuple[str, ...]]:
@@ -311,6 +380,14 @@ filter_gaussians_by_camera_mask = wide.filter_gaussians_by_camera_mask
 make_gaussian_filter = wide.make_gaussian_filter
 
 
+def resolve_dataset_defaults(args):
+    """Multi-frame wrapper: default output dir is ``outputs/<dataset>_wide_multiframes``.
+
+    All other dataset-derived fields are shared with the single-frame resolver.
+    """
+    return wide.resolve_dataset_defaults(args, multiframe=True)
+
+
 # ---------------------------------------------------------------------------
 # Window loading
 # ---------------------------------------------------------------------------
@@ -346,13 +423,16 @@ def load_window_inputs(
     render_camera: int,
     src_hw: tuple[int, int],
     dst_hw: tuple[int, int],
+    extrinsics_mode: str = "per_frame",
 ) -> MultiFrameInputs:
     """Load one window's images/intrinsics/extrinsics, frame-major flattened.
 
-    Every frame uses its own per-frame global camera-to-world matrix
-    ``extrinsics/{frame}_{cam}.txt`` (the single-frame ``cam2ego`` rig is not
-    consulted).  All frames share the resize/crop plan built from ``src_hw``;
-    ``load_resized_rgb`` raises if a frame's source shape differs.
+    ``extrinsics_mode`` selects how each view's global camera-to-world matrix is
+    obtained (see :func:`read_view_extrinsics`): ``per_frame`` (default) reads
+    ``extrinsics/{frame}_{cam}.txt``; ``compose`` builds
+    ``ego_pose/{frame}.txt @ cam2ego_extrinsics/{cam}.txt``.  All frames share
+    the resize/crop plan built from ``src_hw``; ``load_resized_rgb`` raises if a
+    frame's source shape differs.
     """
     plan = wide.plan_resize_and_crop(src_hw, dst_hw)
     newest_frame = window[-1]
@@ -367,20 +447,11 @@ def load_window_inputs(
         for cam in cameras:
             image_path = Path(scene_dir) / "images" / f"{frame}_{cam}.jpg"
             intrinsics_path = Path(scene_dir) / "intrinsics" / f"{cam}.txt"
-            extrinsics_path = per_frame_extrinsics_path(scene_dir, frame, cam)
 
             if not image_path.is_file():
                 raise FileNotFoundError(f"Missing image: {image_path}")
             if not intrinsics_path.is_file():
                 raise FileNotFoundError(f"Missing intrinsics: {intrinsics_path}")
-            if not extrinsics_path.is_file():
-                raise FileNotFoundError(
-                    "Missing per-frame global extrinsics: "
-                    f"{extrinsics_path}. Multi-frame inference uses the "
-                    "per-frame camera-to-world matrices "
-                    "extrinsics/{frame}_{cam}.txt directly for every frame "
-                    "(cam2ego is intentionally not used)."
-                )
 
             pixel_k = wide.read_pixel_intrinsics(intrinsics_path)
             resized_k = wide.resize_and_crop_intrinsics(pixel_k, plan)
@@ -390,7 +461,9 @@ def load_window_inputs(
 
             images.append(wide.load_resized_rgb(image_path, plan))
             intrinsics.append(normalized_k)
-            extrinsics.append(wide.read_matrix(extrinsics_path, size=4))
+            extrinsics.append(
+                read_view_extrinsics(scene_dir, frame, cam, extrinsics_mode)
+            )
 
             if frame == newest_frame and int(cam) == int(render_camera):
                 render_intrinsics_px = resized_k
@@ -432,17 +505,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     data = parser.add_argument_group("data")
     data.add_argument(
+        "--dataset",
+        choices=sorted(DATASETS),
+        default=DEFAULT_DATASET,
+        help=(
+            "Dataset preset selecting paths, cameras, mask naming and "
+            "extrinsics conventions. Unset data flags fall back to the preset; "
+            "explicit flags win. Presets: " + ", ".join(sorted(DATASETS)) + "."
+        ),
+    )
+    data.add_argument(
         "--data-root",
-        default=str(DEFAULT_DATA_ROOT),
-        help="Directory containing the scene folders (relative to repo root).",
+        default=None,
+        help=(
+            "Directory containing the scene folders (relative to repo root). "
+            f"Default: the --dataset preset data root ({DEFAULT_DATA_ROOT})."
+        ),
     )
     data.add_argument(
         "--scene-list",
-        default=str(DEFAULT_SCENE_LIST_PATH),
+        default=None,
         help=(
-            "Scene id list (one scene id per line). Defaults to "
-            "<data-root>/" + DEFAULT_SCENE_LIST_NAME + ", i.e. "
-            f"{DEFAULT_SCENE_LIST_PATH}. Every scene in the list is processed."
+            "Scene id list (one scene id per line). Default: "
+            "<data-root>/<preset scene list name> (e.g. "
+            f"{DEFAULT_SCENE_LIST_PATH}). Every scene in the list is processed."
         ),
     )
     data.add_argument(
@@ -480,23 +566,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     data.add_argument(
         "--cameras",
-        default=",".join(str(c) for c in DEFAULT_CAMERAS),
-        help="Comma separated context camera ids (order preserved).",
+        default=None,
+        help=(
+            "Comma separated context camera ids (order preserved). Default: the "
+            f"--dataset preset cameras ({','.join(str(c) for c in DEFAULT_CAMERAS)} "
+            "for all current presets)."
+        ),
+    )
+    data.add_argument(
+        "--extrinsics-source",
+        choices=MULTI_EXTRINSICS_SOURCE_CHOICES,
+        default=DEFAULT_MULTI_EXTRINSICS_SOURCE,
+        help=(
+            "How each view's global camera-to-world matrix is obtained. 'auto' "
+            "(default) uses the --dataset preset value: 'per_frame' reads "
+            "extrinsics/{frame}_{cam}.txt (nuScenes, Lyft); 'compose' builds "
+            "ego_pose/{frame}.txt @ cam2ego_extrinsics/{cam}.txt (DDAD, which has "
+            "no extrinsics/ directory). Missing files are a hard error."
+        ),
     )
     data.add_argument(
         "--car-mask-root",
-        default=str(DEFAULT_CAR_MASK_ROOT),
+        default=None,
         help=(
-            "Directory with the per-camera nuScenes ego-car masks "
-            "(CAM_FRONT_mask.png, CAM_FRONT_LEFT_mask.png, CAM_FRONT_RIGHT_mask.png, "
-            "CAM_BACK_LEFT_mask.png, CAM_BACK_RIGHT_mask.png, CAM_BACK_mask.png for "
-            "cameras 0..5). Black (<128) pixels are removed and white (>=128) kept, "
-            "transformed with exactly the same resize/crop plan as the images. "
-            "By default each camera's mask is applied to every view EXCEPT the "
-            "current/newest render view: historical t1/t2 cams 5/4/3 are masked and "
-            "the current t3 cams 4/3 are masked, while only the current render view "
-            "(t3 cam5) is fully preserved. A missing mask for any selected camera is "
-            "a hard error."
+            "Directory with the per-camera ego-car masks. Default: the --dataset "
+            "preset mask root. Naming follows the dataset: nuScenes uses "
+            "CAM_*_mask.png under the root; lyft uses <root>/<cam>.jpg; ddad uses "
+            "the per-scene <root>/<scene>/ego_car_masks/<cam>.jpg. Black (<128) "
+            "pixels are removed and white (>=128) kept, transformed with exactly "
+            "the same resize/crop plan as the images. By default each camera's "
+            "mask is applied to every view EXCEPT the current/newest render view: "
+            "historical cams 5/4/3 and the current cams 4/3 are masked, while only "
+            "the current render view (cam5) is fully preserved. A missing mask for "
+            "any selected camera is a hard error."
         ),
     )
     data.add_argument(
@@ -609,8 +711,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--render-camera",
         type=int,
-        default=DEFAULT_RENDER_CAMERA,
-        help="Camera id rendered in the wide view (from the newest frame).",
+        default=None,
+        help=(
+            "Camera id rendered in the wide view (from the newest frame). "
+            f"Default: the --dataset preset render camera ({DEFAULT_RENDER_CAMERA})."
+        ),
     )
     render.add_argument(
         "--width-factor",
@@ -624,10 +729,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     out = parser.add_argument_group("output")
     out.add_argument(
         "--output-dir",
-        default=str(DEFAULT_OUTPUT_DIR),
+        default=None,
         help=(
-            "Output root directory. Use a distinct directory from the "
-            "single-frame run: file names are shared "
+            "Output root directory. Default: outputs/<dataset>_wide_multiframes "
+            f"(i.e. {DEFAULT_OUTPUT_DIR} for nuscenes). Use a distinct directory "
+            "from the single-frame run: file names are shared "
             "(<scene>/rgb/{newest_frame}_{render_cam}_wide.jpg)."
         ),
     )
@@ -671,16 +777,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     torch.set_float32_matmul_precision("high")
 
+    # Resolve the dataset preset and any unset (None) dataset-derived CLI fields
+    # first; explicit flags always win.  The scene list is built from the
+    # (possibly explicit) data root, so overriding only --data-root still reads
+    # that root's preset scene list.
+    dataset = resolve_dataset_defaults(args)
     data_root = wide.resolve_local(args.data_root)
-    # Keep the parser's canonical scene-list default relative to --data-root so
-    # overriding only --data-root still reads that root's nuScenes_Val2.txt; an
-    # explicit --scene-list wins.
-    if args.scene_list == str(wide.DEFAULT_SCENE_LIST_PATH):
-        scene_list = data_root / DEFAULT_SCENE_LIST_NAME
-    else:
-        scene_list = wide.resolve_local(args.scene_list)
+    scene_list = wide.resolve_local(args.scene_list)
     output_dir = wide.resolve_local(args.output_dir)
     cameras = wide.parse_cameras(args.cameras)
+    extrinsics_mode = resolve_multi_extrinsics_mode(
+        args.extrinsics_source, dataset
+    )
 
     num_frames = int(args.num_frames)
     if num_frames < 1:
@@ -691,10 +799,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     local_mv_match = resolve_local_mv_match(args, num_frames, cameras)
+    if extrinsics_mode == "compose":
+        extrinsics_detail = (
+            "compose ego_pose/{frame}.txt @ cam2ego_extrinsics/{cam}.txt"
+        )
+    else:
+        extrinsics_detail = "per-frame global extrinsics/{frame}_{cam}.txt"
     print(
-        f"[info] Multi-frame windows of {num_frames} frame(s) x cameras "
-        f"{cameras}; local_mv_match={local_mv_match}. Using the per-frame "
-        "global camera-to-world matrices extrinsics/{frame}_{cam}.txt directly.",
+        f"[info] Dataset preset '{dataset.name}' (mask kind={dataset.mask_kind}); "
+        f"multi-frame windows of {num_frames} frame(s) x cameras {cameras}; "
+        f"local_mv_match={local_mv_match}; extrinsics_source="
+        f"{args.extrinsics_source}->{extrinsics_mode} ({extrinsics_detail}).",
         file=sys.stderr,
     )
 
@@ -724,13 +839,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args, preset, dinov2_source, local_mv_match=local_mv_match
     )
     patch_size = wide.effective_patch_size(cfg_dict)
-    dst_hw = wide.round_hw_to_multiple(requested_hw, patch_size)
+    dst_hw = wide.resolve_dataset_input_hw(args, preset, dataset, patch_size)
     if dst_hw != requested_hw:
-        print(
-            f"[info] Input size {requested_hw[0]}x{requested_hw[1]} rounded to "
-            f"{dst_hw[0]}x{dst_hw[1]} (multiple of effective patch {patch_size}).",
-            file=sys.stderr,
-        )
+        if (
+            dataset.input_height_policy == "aspect"
+            and args.height is None
+            and args.input_size is None
+        ):
+            print(
+                f"[info] Dataset '{dataset.name}' derives the input height from "
+                f"its native aspect at width {dst_hw[1]}: "
+                f"{requested_hw[0]}x{requested_hw[1]} -> {dst_hw[0]}x{dst_hw[1]} "
+                f"(nearest multiple of effective patch {patch_size}).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[info] Input size {requested_hw[0]}x{requested_hw[1]} rounded to "
+                f"{dst_hw[0]}x{dst_hw[1]} (multiple of effective patch {patch_size}).",
+                file=sys.stderr,
+            )
 
     checkpoint_path = (
         wide.resolve_local(args.checkpoint)
@@ -803,17 +931,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     src_hw = wide.image_size(first_image)
     print(f"Source image resolution: {src_hw[0]}x{src_hw[1]}")
 
-    # Ego-car masking is enabled by default.  The masks are static, T/camera
-    # order is fixed and the resize/crop plan is constant, so every mask (and
-    # the per-view keep mask) is loaded/built exactly once here, after
-    # src_hw/dst_hw are known and before any window is touched.  The render view
-    # is the flattened index of the newest frame's render camera.
+    # Ego-car masking is enabled by default.  nuScenes/Lyft masks are
+    # dataset-level and loaded once; DDAD masks are per scene, so a cache keyed
+    # by scene (``None`` for dataset-level kinds) keeps both cases correct.  The
+    # render view is the flattened index of the newest frame's render camera.
     render_index = newest_render_index(num_frames, cameras, args.render_camera)
     mask_policy = resolve_car_mask_policy(
         args.disable_car_mask, args.mask_render_view
     )
-    gaussian_filter = None
+    mask_root = None
+    plan = None
     keep_mask = None
+    mask_cache: dict = {}
+
+    def prepare_masks(scene: str):
+        """Return the cached ``(keep_mask, gaussian_filter)`` for ``scene``."""
+        key = scene if dataset.mask_kind == "ddad" else None
+        if key not in mask_cache:
+            camera_keep_masks = load_camera_keep_masks(
+                mask_root,
+                cameras,
+                plan,
+                kind=dataset.mask_kind,
+                scene=scene,
+                ext=dataset.mask_ext,
+            )
+            keep = build_car_keep_mask(
+                camera_keep_masks,
+                cameras,
+                num_frames,
+                dst_hw,
+                render_index,
+                mask_render_view=args.mask_render_view,
+            )
+            mask_cache[key] = (keep, make_gaussian_filter(keep))
+        return mask_cache[key]
+
     if mask_policy is None:
         print(
             "[info] Ego-car masking DISABLED (--disable-car-mask, highest "
@@ -823,16 +976,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         mask_root = wide.resolve_local(args.car_mask_root)
         plan = wide.plan_resize_and_crop(src_hw, dst_hw)
-        camera_keep_masks = load_camera_keep_masks(mask_root, cameras, plan)
-        keep_mask = build_car_keep_mask(
-            camera_keep_masks,
-            cameras,
-            num_frames,
-            dst_hw,
-            render_index,
-            mask_render_view=args.mask_render_view,
-        )
-        gaussian_filter = make_gaussian_filter(keep_mask)
+        keep_mask, _ = prepare_masks(jobs[0][0])
         retained = int(keep_mask.sum())
         total = int(keep_mask.size)
         if mask_policy == CAR_MASK_POLICY_ALL:
@@ -846,11 +990,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"frame cam{args.render_camera}) at render_index={render_index}, "
                 "which is fully preserved"
             )
+        scope = "per scene" if dataset.mask_kind == "ddad" else "dataset-level"
         print(
-            f"[info] Ego-car masking enabled from {mask_root} "
-            f"(policy={mask_policy}): {policy_detail}; kept {retained}/{total} "
-            f"resized mask pixels ({total - retained} removed) over "
-            f"V={keep_mask.shape[0]} views.",
+            f"[info] Ego-car masking enabled from {mask_root} ({scope}) "
+            f"(policy={mask_policy}): {policy_detail}; first window scene kept "
+            f"{retained}/{total} resized mask pixels ({total - retained} removed) "
+            f"over V={keep_mask.shape[0]} views.",
             file=sys.stderr,
         )
 
@@ -859,6 +1004,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             jobs, total=len(jobs), unit="window", desc="Validating windows (dry-run)"
         ) as progress:
             for index, (scene, window) in enumerate(progress):
+                if mask_policy is not None:
+                    # Validate this scene's masks (DDAD masks are per scene).
+                    prepare_masks(scene)
                 inputs = load_window_inputs(
                     data_root / scene,
                     scene,
@@ -867,6 +1015,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.render_camera,
                     src_hw,
                     dst_hw,
+                    extrinsics_mode=extrinsics_mode,
                 )
                 wide_px, out_hw = wide.make_wide_intrinsics(
                     inputs.render_intrinsics_px,
@@ -925,6 +1074,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             newest_frame = window[-1]
             progress.set_postfix(scene=scene, out=newest_frame)
             scene_dir = data_root / scene
+            scene_filter = None
+            if mask_policy is not None:
+                _, scene_filter = prepare_masks(scene)
             inputs = load_window_inputs(
                 scene_dir,
                 scene,
@@ -933,6 +1085,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.render_camera,
                 src_hw,
                 dst_hw,
+                extrinsics_mode=extrinsics_mode,
             )
             # ``_render_wide_impl`` is reused unchanged: it only needs the
             # ``images``/``intrinsics``/``extrinsics``/``render_intrinsics_px``
@@ -950,7 +1103,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.far,
                 device,
                 args.amp,
-                gaussian_filter=gaussian_filter,
+                gaussian_filter=scene_filter,
             )
             progress.set_postfix(
                 scene=scene, out=newest_frame, res=f"{out_h}x{out_w}"

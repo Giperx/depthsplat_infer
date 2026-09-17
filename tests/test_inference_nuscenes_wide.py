@@ -400,6 +400,9 @@ class ParserDefaultsTest(unittest.TestCase):
 
     def setUp(self):
         self.args = wide.build_arg_parser().parse_args([])
+        # Dataset-derived fields default to None in the parser and are filled
+        # from the selected --dataset preset (nuscenes by default).
+        wide.resolve_dataset_defaults(self.args)
 
     def test_model_preset_default(self):
         self.assertEqual(self.args.model, "256x448")
@@ -450,7 +453,7 @@ class ParserDefaultsTest(unittest.TestCase):
     def test_camera_defaults(self):
         self.assertEqual(self.args.cameras, "5,4,3")
         self.assertEqual(self.args.render_camera, 5)
-        self.assertEqual(self.args.width_factor, 2.0)
+        self.assertEqual(self.args.width_factor, 3.0)
 
     def test_output_dir_default(self):
         self.assertEqual(self.args.output_dir, "outputs/nuscenes_wide")
@@ -554,6 +557,7 @@ class ExtrinsicsSourceTest(unittest.TestCase):
 
     def test_parser_default_is_cam2ego(self):
         args = wide.build_arg_parser().parse_args([])
+        wide.resolve_dataset_defaults(args)
         self.assertEqual(args.extrinsics_source, "cam2ego")
         self.assertEqual(wide.DEFAULT_EXTRINSICS_SOURCE, "cam2ego")
         self.assertEqual(wide.EXTRINSICS_SOURCE_CHOICES, ("cam2ego", "per_frame"))
@@ -597,6 +601,7 @@ class CarMaskParserDefaultsTest(unittest.TestCase):
 
     def setUp(self):
         self.args = wide.build_arg_parser().parse_args([])
+        wide.resolve_dataset_defaults(self.args)
 
     def test_defaults(self):
         self.assertEqual(
@@ -662,6 +667,295 @@ class SharedMaskConstantsTest(unittest.TestCase):
         self.assertEqual(
             wide.resolve_car_mask_policy(False, True), wide.CAR_MASK_POLICY_ALL
         )
+
+
+class DatasetPresetTest(unittest.TestCase):
+    """The dataset preset table describes each split's conventions."""
+
+    def test_all_presets_present(self):
+        self.assertEqual(
+            set(wide.DATASETS), {"nuscenes", "lyft1920", "lyft1224", "ddad"}
+        )
+        self.assertEqual(wide.DEFAULT_DATASET, "nuscenes")
+
+    def test_nuscenes_preset_matches_legacy_defaults(self):
+        preset = wide.DATASETS["nuscenes"]
+        self.assertEqual(preset.data_root, str(wide.DEFAULT_DATA_ROOT))
+        self.assertEqual(preset.scene_list_name, wide.DEFAULT_SCENE_LIST_NAME)
+        self.assertEqual(preset.cameras, wide.DEFAULT_CAMERAS)
+        self.assertEqual(preset.render_camera, wide.DEFAULT_RENDER_CAMERA)
+        self.assertEqual(preset.mask_kind, "nuscenes")
+        self.assertEqual(Path(preset.mask_root), wide.DEFAULT_CAR_MASK_ROOT)
+        self.assertEqual(preset.mask_ext, "png")
+        self.assertEqual(preset.single_extrinsics, "cam2ego")
+        self.assertEqual(preset.multi_extrinsics, "per_frame")
+        self.assertEqual(preset.input_height_policy, "model")
+        self.assertEqual(preset.native_hw, (900, 1600))
+
+    def test_lyft_presets(self):
+        for name, root, listed, policy, native in (
+            (
+                "lyft1920",
+                "datasets/lyft/lyft_val1920_3cams",
+                "lyft_val1920.txt",
+                "model",
+                (1080, 1920),
+            ),
+            (
+                "lyft1224",
+                "datasets/lyft/lyft_val1224_3cams",
+                "lyft_val1224.txt",
+                "aspect",
+                (1024, 1224),
+            ),
+        ):
+            with self.subTest(dataset=name):
+                preset = wide.DATASETS[name]
+                self.assertEqual(preset.data_root, root)
+                self.assertEqual(preset.scene_list_name, listed)
+                self.assertEqual(preset.mask_kind, "lyft")
+                self.assertEqual(preset.mask_root, f"{root}/ego_car_masks")
+                self.assertEqual(preset.mask_ext, "jpg")
+                self.assertEqual(preset.single_extrinsics, "cam2ego")
+                self.assertEqual(preset.multi_extrinsics, "per_frame")
+                self.assertEqual(preset.input_height_policy, policy)
+                self.assertEqual(preset.native_hw, native)
+
+    def test_ddad_preset_composes_extrinsics(self):
+        preset = wide.DATASETS["ddad"]
+        self.assertEqual(preset.data_root, "datasets/ddad/valid")
+        self.assertEqual(preset.scene_list_name, "valid.txt")
+        self.assertEqual(preset.mask_kind, "ddad")
+        self.assertEqual(preset.mask_root, "datasets/ddad/valid")
+        self.assertEqual(preset.mask_ext, "jpg")
+        self.assertEqual(preset.single_extrinsics, "cam2ego")
+        self.assertEqual(preset.multi_extrinsics, "compose")
+        self.assertEqual(preset.input_height_policy, "aspect")
+        self.assertEqual(preset.native_hw, (1216, 1936))
+
+    def test_all_presets_share_cameras(self):
+        for preset in wide.DATASETS.values():
+            with self.subTest(dataset=preset.name):
+                self.assertEqual(preset.cameras, (5, 4, 3))
+                self.assertEqual(preset.render_camera, 5)
+
+
+class InputHeightDerivationTest(unittest.TestCase):
+    """Aspect-derived heights pick the nearest multiple of the patch size."""
+
+    def test_expected_values(self):
+        self.assertEqual(wide.derive_input_height((1024, 1224), 448, 64), 384)
+        self.assertEqual(wide.derive_input_height((1216, 1936), 448, 64), 256)
+        self.assertEqual(wide.derive_input_height((1024, 1224), 768, 64), 640)
+        self.assertEqual(wide.derive_input_height((1216, 1936), 768, 64), 512)
+
+    def test_clamped_to_one_patch(self):
+        self.assertEqual(wide.derive_input_height((100, 100000), 8, 64), 64)
+
+    def test_rejects_invalid_inputs(self):
+        with self.assertRaises(ValueError):
+            wide.derive_input_height((0, 10), 448, 64)
+        with self.assertRaises(ValueError):
+            wide.derive_input_height((10, 10), 0, 64)
+        with self.assertRaises(ValueError):
+            wide.derive_input_height((10, 10), 448, 0)
+
+
+class DatasetInputResolutionTest(unittest.TestCase):
+    """Per-dataset input resolution with the aspect-height policy."""
+
+    MODELS = wide.MODEL_PRESETS
+
+    def _resolve(self, dataset, argv, patch=64):
+        args = wide.build_arg_parser().parse_args(["--dataset", dataset, *argv])
+        preset = wide.resolve_dataset_defaults(args)
+        return wide.resolve_dataset_input_hw(
+            args, self.MODELS[args.model], preset, patch
+        )
+
+    def test_default_width_factor_is_three(self):
+        self.assertEqual(wide.DEFAULT_WIDTH_FACTOR, 3.0)
+
+    def test_model_policy_keeps_preset_size(self):
+        for name in ("nuscenes", "lyft1920"):
+            with self.subTest(dataset=name):
+                self.assertEqual(self._resolve(name, []), (256, 448))
+                self.assertEqual(
+                    self._resolve(name, ["--model", "448x768"]), (448, 768)
+                )
+                # An explicit width does not change the model-policy height.
+                self.assertEqual(
+                    self._resolve(name, ["--width", "768"]), (256, 768)
+                )
+
+    def test_lyft1224_derives_height(self):
+        self.assertEqual(self._resolve("lyft1224", []), (384, 448))
+        self.assertEqual(
+            self._resolve("lyft1224", ["--model", "448x768"]), (640, 768)
+        )
+        self.assertEqual(
+            self._resolve("lyft1224", ["--width", "768"]), (640, 768)
+        )
+
+    def test_ddad_derives_height(self):
+        self.assertEqual(self._resolve("ddad", []), (256, 448))
+        self.assertEqual(self._resolve("ddad", ["--model", "448x768"]), (512, 768))
+        self.assertEqual(self._resolve("ddad", ["--width", "768"]), (512, 768))
+
+    def test_explicit_height_wins(self):
+        # The height of an explicit --input-size and --height are honored (and
+        # floored to the patch size), bypassing the aspect derivation.
+        self.assertEqual(
+            self._resolve("lyft1224", ["--input-size", "448x768"]), (448, 768)
+        )
+        self.assertEqual(
+            self._resolve("ddad", ["--input-size", "448x768"]), (448, 768)
+        )
+        self.assertEqual(self._resolve("lyft1224", ["--height", "512"]), (512, 448))
+        self.assertEqual(self._resolve("lyft1224", ["--height", "500"]), (448, 448))
+
+    def test_width_is_floored_to_patch(self):
+        # --width 700 floors to 640, then ddad derives height 384.
+        self.assertEqual(self._resolve("ddad", ["--width", "700"]), (384, 640))
+
+
+class CameraMaskPathKindsTest(unittest.TestCase):
+    """Mask naming differs per dataset kind (nuscenes / lyft / ddad)."""
+
+    def test_nuscenes_names_and_unknown_camera(self):
+        self.assertEqual(
+            wide.camera_mask_path("/m", 5), Path("/m/CAM_BACK_mask.png")
+        )
+        self.assertEqual(
+            wide.camera_mask_path("/m", 3), Path("/m/CAM_BACK_LEFT_mask.png")
+        )
+        with self.assertRaises(KeyError):
+            wide.camera_mask_path("/m", 6)
+
+    def test_lyft_bare_camera_id(self):
+        self.assertEqual(
+            wide.camera_mask_path("/m", 4, kind="lyft", ext="jpg"),
+            Path("/m/4.jpg"),
+        )
+
+    def test_ddad_per_scene(self):
+        self.assertEqual(
+            wide.camera_mask_path("/m", 3, kind="ddad", scene="007", ext="jpg"),
+            Path("/m/007/ego_car_masks/3.jpg"),
+        )
+        with self.assertRaises(ValueError):
+            wide.camera_mask_path("/m", 3, kind="ddad")
+
+    def test_unknown_kind_rejected(self):
+        with self.assertRaises(ValueError):
+            wide.camera_mask_path("/m", 3, kind="kitti")
+
+    def test_load_camera_keep_masks_ddad_per_scene(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "valid"
+            (root / "007" / "ego_car_masks").mkdir(parents=True)
+            for cam in (5, 4, 3):
+                Image.new("L", (2, 2), 255).save(
+                    root / "007" / "ego_car_masks" / f"{cam}.jpg"
+                )
+            plan = wide.plan_resize_and_crop((2, 2), (2, 2))
+            masks = wide.load_camera_keep_masks(
+                root, (5, 4, 3), plan, kind="ddad", scene="007", ext="jpg"
+            )
+            self.assertEqual(set(masks), {5, 4, 3})
+            # A different scene has no masks: hard error naming the path.
+            with self.assertRaises(FileNotFoundError) as ctx:
+                wide.load_camera_keep_masks(
+                    root, (5, 4, 3), plan, kind="ddad", scene="008", ext="jpg"
+                )
+            self.assertIn("008", str(ctx.exception))
+
+
+class DatasetDefaultsTest(unittest.TestCase):
+    """Unset CLI fields resolve to the selected dataset preset."""
+
+    @staticmethod
+    def _resolve(argv):
+        args = wide.build_arg_parser().parse_args(argv)
+        preset = wide.resolve_dataset_defaults(args)
+        return args, preset
+
+    def test_nuscenes_regression_identical(self):
+        args, preset = self._resolve([])
+        self.assertEqual(preset.name, "nuscenes")
+        self.assertEqual(args.data_root, str(wide.DEFAULT_DATA_ROOT))
+        self.assertEqual(args.scene_list, str(wide.DEFAULT_SCENE_LIST_PATH))
+        self.assertEqual(args.cameras, "5,4,3")
+        self.assertEqual(args.render_camera, 5)
+        self.assertEqual(args.car_mask_root, str(wide.DEFAULT_CAR_MASK_ROOT))
+        self.assertEqual(args.output_dir, "outputs/nuscenes_wide")
+        self.assertEqual(args.extrinsics_source, "cam2ego")
+
+    def test_lyft1920_defaults(self):
+        args, preset = self._resolve(["--dataset", "lyft1920"])
+        self.assertEqual(preset.name, "lyft1920")
+        self.assertEqual(args.data_root, "datasets/lyft/lyft_val1920_3cams")
+        self.assertEqual(
+            args.scene_list,
+            "datasets/lyft/lyft_val1920_3cams/lyft_val1920.txt",
+        )
+        self.assertEqual(
+            args.car_mask_root,
+            "datasets/lyft/lyft_val1920_3cams/ego_car_masks",
+        )
+        self.assertEqual(args.output_dir, "outputs/lyft1920_wide")
+        self.assertEqual(args.extrinsics_source, "cam2ego")
+
+    def test_lyft1224_defaults(self):
+        args, _ = self._resolve(["--dataset", "lyft1224"])
+        self.assertEqual(args.data_root, "datasets/lyft/lyft_val1224_3cams")
+        self.assertEqual(
+            args.scene_list,
+            "datasets/lyft/lyft_val1224_3cams/lyft_val1224.txt",
+        )
+        self.assertEqual(
+            args.car_mask_root,
+            "datasets/lyft/lyft_val1224_3cams/ego_car_masks",
+        )
+        self.assertEqual(args.output_dir, "outputs/lyft1224_wide")
+
+    def test_ddad_defaults(self):
+        args, _ = self._resolve(["--dataset", "ddad"])
+        self.assertEqual(args.data_root, "datasets/ddad/valid")
+        self.assertEqual(args.scene_list, "datasets/ddad/valid/valid.txt")
+        self.assertEqual(args.car_mask_root, "datasets/ddad/valid")
+        self.assertEqual(args.output_dir, "outputs/ddad_wide")
+
+    def test_explicit_flags_win_and_scene_list_follows_data_root(self):
+        args, _ = self._resolve(
+            [
+                "--dataset",
+                "lyft1920",
+                "--data-root",
+                "/custom",
+                "--cameras",
+                "6,5",
+                "--render-camera",
+                "6",
+                "--car-mask-root",
+                "/masks",
+                "--output-dir",
+                "/out",
+            ]
+        )
+        self.assertEqual(args.data_root, "/custom")
+        # Scene list is built from the explicit data root and preset name.
+        self.assertEqual(args.scene_list, "/custom/lyft_val1920.txt")
+        self.assertEqual(args.cameras, "6,5")
+        self.assertEqual(args.render_camera, 6)
+        self.assertEqual(args.car_mask_root, "/masks")
+        self.assertEqual(args.output_dir, "/out")
+
+    def test_parser_rejects_unknown_dataset(self):
+        with self.assertRaises(SystemExit):
+            wide.build_arg_parser().parse_args(["--dataset", "kitti"])
 
 
 class SingleFrameCarMaskPolicyTest(unittest.TestCase):

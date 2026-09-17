@@ -94,9 +94,16 @@ DEFAULT_SCENE_LIST_PATH = wide.DEFAULT_SCENE_LIST_PATH
 DEFAULT_SCENE_LIST_NAME = wide.DEFAULT_SCENE_LIST_NAME
 DEFAULT_CAMERAS = wide.DEFAULT_CAMERAS  # (5, 4, 3)
 DEFAULT_RENDER_CAMERA = wide.DEFAULT_RENDER_CAMERA  # 5
-DEFAULT_WIDTH_FACTOR = wide.DEFAULT_WIDTH_FACTOR  # 2.0
+DEFAULT_WIDTH_FACTOR = wide.DEFAULT_WIDTH_FACTOR  # 3.0
 DEFAULT_CAR_MASK_ROOT = wide.DEFAULT_CAR_MASK_ROOT
 DEFAULT_PRESET = wide.DEFAULT_PRESET  # "256x448"
+DEFAULT_DATASET = wide.DEFAULT_DATASET
+DATASETS = wide.DATASETS
+
+
+def resolve_dataset_defaults(args):
+    """Fill unset dataset-derived fields from ``--dataset`` (benchmark wrapper)."""
+    return wide.resolve_dataset_defaults(args)
 
 MODE_SINGLE = "single"
 MODE_MULTI = "multi"
@@ -279,16 +286,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     data = parser.add_argument_group("sample selection")
     data.add_argument(
+        "--dataset",
+        choices=sorted(DATASETS),
+        default=DEFAULT_DATASET,
+        help=(
+            "Dataset preset selecting paths, cameras, mask naming and "
+            "extrinsics conventions. Unset data flags fall back to the preset. "
+            "Presets: " + ", ".join(sorted(DATASETS)) + "."
+        ),
+    )
+    data.add_argument(
         "--data-root",
-        default=str(DEFAULT_DATA_ROOT),
-        help="Directory containing the scene folders (relative to repo root).",
+        default=None,
+        help=(
+            "Directory containing the scene folders (relative to repo root). "
+            f"Default: the --dataset preset data root ({DEFAULT_DATA_ROOT})."
+        ),
     )
     data.add_argument(
         "--scene-list",
-        default=str(DEFAULT_SCENE_LIST_PATH),
+        default=None,
         help=(
-            "Scene id list (one scene id per line). Defaults to "
-            "<data-root>/" + DEFAULT_SCENE_LIST_NAME + "."
+            "Scene id list (one scene id per line). Default: "
+            "<data-root>/<preset scene list name>."
         ),
     )
     data.add_argument(
@@ -313,14 +333,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     data.add_argument(
         "--cameras",
-        default=",".join(str(cam) for cam in DEFAULT_CAMERAS),
-        help="Comma separated context camera ids (order preserved).",
+        default=None,
+        help=(
+            "Comma separated context camera ids (order preserved). Default: the "
+            "--dataset preset cameras."
+        ),
     )
     data.add_argument(
         "--render-camera",
         type=int,
-        default=DEFAULT_RENDER_CAMERA,
-        help="Camera id rendered in the wide view.",
+        default=None,
+        help=(
+            "Camera id rendered in the wide view. Default: the --dataset preset "
+            "render camera."
+        ),
     )
     data.add_argument(
         "--width-factor",
@@ -344,12 +370,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     masks = parser.add_argument_group("ego-car masking")
     masks.add_argument(
         "--car-mask-root",
-        default=str(DEFAULT_CAR_MASK_ROOT),
+        default=None,
         help=(
-            "Directory with the per-camera nuScenes ego-car masks. Black "
-            "(<128) pixels are removed and white (>=128) kept, transformed with "
-            "exactly the same resize/crop plan as the images. A missing mask for "
-            "any selected camera is a hard error."
+            "Directory with the per-camera ego-car masks. Default: the --dataset "
+            "preset mask root (nuScenes CAM_*_mask.png, Lyft <cam>.jpg, DDAD "
+            "per-scene <scene>/ego_car_masks/<cam>.jpg). Black (<128) pixels are "
+            "removed and white (>=128) kept, transformed with exactly the same "
+            "resize/crop plan as the images. A missing mask for any selected "
+            "camera is a hard error."
         ),
     )
     masks.add_argument(
@@ -455,11 +483,7 @@ def _resolve_sample(args, data_root: Path):
     if args.scene is not None:
         scene = str(args.scene)
     else:
-        scene_list = (
-            data_root / DEFAULT_SCENE_LIST_NAME
-            if args.scene_list == str(DEFAULT_SCENE_LIST_PATH)
-            else wide.resolve_local(args.scene_list)
-        )
+        scene_list = wide.resolve_local(args.scene_list)
         if not scene_list.is_file():
             raise SystemExit(f"Scene list not found: {scene_list}")
         scene = select_scene(wide.read_scene_list(scene_list))
@@ -505,6 +529,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.measure < 1:
         raise SystemExit(f"--measure must be >= 1, got {args.measure}.")
 
+    # Resolve the dataset preset and any unset dataset-derived CLI fields first.
+    dataset = resolve_dataset_defaults(args)
     cameras = wide.parse_cameras(args.cameras)
     if args.render_camera not in cameras:
         raise SystemExit(
@@ -512,6 +538,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     num_frames = resolve_num_frames(mode, args.num_frames)
     local_mv_match = resolve_local_mv_match(mode, args, num_frames, cameras)
+    extrinsics_mode = (
+        dataset.single_extrinsics
+        if mode == MODE_SINGLE
+        else mf.resolve_multi_extrinsics_mode(
+            mf.DEFAULT_MULTI_EXTRINSICS_SOURCE, dataset
+        )
+    )
 
     data_root = wide.resolve_local(args.data_root)
     scene, scene_dir, cameras, num_frames, sample = _resolve_sample(args, data_root)
@@ -539,13 +572,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args, preset, dinov2_source, local_mv_match=local_mv_match
     )
     patch_size = wide.effective_patch_size(cfg_dict)
-    dst_hw = wide.round_hw_to_multiple(requested_hw, patch_size)
+    dst_hw = wide.resolve_dataset_input_hw(args, preset, dataset, patch_size)
     if dst_hw != requested_hw:
-        print(
-            f"[info] Input size {requested_hw[0]}x{requested_hw[1]} rounded to "
-            f"{dst_hw[0]}x{dst_hw[1]} (multiple of effective patch {patch_size}).",
-            file=sys.stderr,
-        )
+        if (
+            dataset.input_height_policy == "aspect"
+            and args.height is None
+            and args.input_size is None
+        ):
+            print(
+                f"[info] Dataset '{dataset.name}' derives the input height from "
+                f"its native aspect at width {dst_hw[1]}: "
+                f"{requested_hw[0]}x{requested_hw[1]} -> {dst_hw[0]}x{dst_hw[1]} "
+                f"(nearest multiple of effective patch {patch_size}).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[info] Input size {requested_hw[0]}x{requested_hw[1]} rounded to "
+                f"{dst_hw[0]}x{dst_hw[1]} (multiple of effective patch {patch_size}).",
+                file=sys.stderr,
+            )
 
     checkpoint_path = (
         wide.resolve_local(args.checkpoint)
@@ -582,7 +628,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         mask_root = wide.resolve_local(args.car_mask_root)
         plan = wide.plan_resize_and_crop(src_hw, dst_hw)
-        camera_keep_masks = wide.load_camera_keep_masks(mask_root, cameras, plan)
+        camera_keep_masks = wide.load_camera_keep_masks(
+            mask_root,
+            cameras,
+            plan,
+            kind=dataset.mask_kind,
+            scene=scene,
+            ext=dataset.mask_ext,
+        )
         keep_mask = wide.build_car_keep_mask(
             camera_keep_masks,
             cameras,
@@ -596,9 +649,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         total = int(keep_mask.size)
         print(
             f"[info] Ego-car masking enabled from {mask_root} "
-            f"(policy={mask_policy}, render_index={render_index}): kept "
-            f"{retained}/{total} resized mask pixels over V={keep_mask.shape[0]} "
-            "views.",
+            f"(kind={dataset.mask_kind}, policy={mask_policy}, "
+            f"render_index={render_index}): kept {retained}/{total} resized mask "
+            f"pixels over V={keep_mask.shape[0]} views.",
             file=sys.stderr,
         )
 
@@ -630,7 +683,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.render_camera,
             src_hw,
             dst_hw,
-            extrinsics_source=wide.DEFAULT_EXTRINSICS_SOURCE,
+            extrinsics_source=extrinsics_mode,
         )
     else:
         inputs = mf.load_window_inputs(
@@ -641,6 +694,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.render_camera,
             src_hw,
             dst_hw,
+            extrinsics_mode=extrinsics_mode,
         )
     data_load_ms = (time.perf_counter() - load_start) * 1000.0
 
@@ -704,6 +758,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"\n{'=' * 72}")
     print(" DepthSplat nuScenes wide-view speed benchmark")
     print(f"{'=' * 72}")
+    print(f"  Dataset:         {dataset.name} (mask kind {dataset.mask_kind})")
     print(f"  Mode:            {mode}")
     print(f"  Scene / sample:  {scene} / {sample_label}")
     if mode == MODE_MULTI:
@@ -713,6 +768,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  Input shape:     {input_shape}  (V, C, H, W)")
     print(f"  V (views):       {v}")
     print(f"  Output shape:    {output_shape}  (C, H, W)")
+    print(f"  Extrinsics:      {extrinsics_mode}")
     print(f"  local_mv_match:  {local_mv_match}")
     print(f"  Mask policy:     {mask_label}")
     print(f"  AMP:             {bool(args.amp)}")
@@ -729,6 +785,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.json is not None:
         payload = {
+            "dataset": dataset.name,
+            "mask_kind": dataset.mask_kind,
+            "extrinsics_mode": extrinsics_mode,
             "mode": mode,
             "model": model,
             "scene": scene,

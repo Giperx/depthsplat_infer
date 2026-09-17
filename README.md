@@ -461,7 +461,7 @@ python scripts/inference_nuscenes_wide.py \
   --scene 037 \
   --frame 0 \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
-  --width-factor 2 \
+  --width-factor 3 \
   --output-dir outputs/nuscenes_wide
 
 # Ego-car masking is on by default (cameras 4 and 3 masked, render camera 5
@@ -479,7 +479,7 @@ python scripts/inference_nuscenes_wide.py \
 - The model defaults to the `256x448` preset (whose default input is therefore
   `256x448`; the `448x768` model is available via `--model 448x768`); context
   cameras default to `5,4,3`, the render camera to `5`, and the output width
-  factor to `2`.
+  factor to `3` (`256x448 -> 256x1344`, `448x768 -> 448x2304`).
 - `--model` selects the **architecture preset**: it fixes `vitb`,
   `num_scales`, `upsample_factor`, `lowest_feature_resolution` and
   `gaussian_scale_max`, and chooses the matching default checkpoint. It is
@@ -588,10 +588,10 @@ them as "applied but 0 removed" today.
 The `--model` preset selects the matching locally shipped base checkpoint and
 its architecture; `--input-size` chooses the input resize independently:
 
-| `--model` (alias `--resolution`) | Default checkpoint | Default input | Output (factor 2) | `gaussian_scale_max` |
+| `--model` (alias `--resolution`) | Default checkpoint | Default input | Output (factor 3) | `gaussian_scale_max` |
 | --- | --- | --- | --- | --- |
-| `256x448` (default) | `pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth` | 256x448 | 256x896 | 3.0 |
-| `448x768` | `pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth` | 448x768 | 448x1536 | 0.1 |
+| `256x448` (default) | `pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth` | 256x448 | 256x1344 | 3.0 |
+| `448x768` | `pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth` | 448x768 | 448x2304 | 0.1 |
 
 Both are 117M `vitb` models, so the script sets
 `monodepth_vit_type=vitb`, `num_scales=2`, `upsample_factor=4` and
@@ -673,7 +673,7 @@ or clone `facebookresearch/dinov2` and point `--dinov2-source` at the clone.
   reports a clear error if it is missing.
 - DepthSplat's decoder exposes rendered color and depth only; it does not expose
   an alpha mask, so no mask is written (rather than inventing a misleading one).
-- The released checkpoints were not trained on nuScenes, and a 2x-wide camera-5
+- The released checkpoints were not trained on nuScenes, and a 3x-wide camera-5
   frustum is outside the training distribution, so results are for research
   exploration rather than a trained-model benchmark.
 
@@ -840,13 +840,151 @@ windows), where the encoder matches all views and ignores the setting.
   `<output>/<scene>/rgb/{newest_frame}_{render_cam}_wide.jpg` (JPEG quality 95),
   e.g. `002_5_wide.jpg` — the same file naming as the single-frame script. Use a
   **different `--output-dir`** from the single-frame run to avoid overwriting its
-  results; the default is `outputs/nuscenes_wide_multiframes`.
+  results; the default is `outputs/<dataset>_wide_multiframes`
+  (`outputs/nuscenes_wide_multiframes` for nuscenes).
+- The default width factor is `3` (same as the single-frame path): an input of
+  `256x448` renders `256x1344` and `448x768` renders `448x2304` (aspect-derived
+  inputs, e.g. lyft1224 `384x448`, render `384x1344`).
 - Input images are not saved unless `--save-inputs` is passed, and no mask/alpha
   image is invented.
 
 Model presets, `--input-size` semantics, offline DINOv2 handling, resize/crop and
 patch sizes, strict encoder loading and `--dry-run` are shared with the
 single-frame script and documented above.
+
+## Lyft and DDAD (dataset presets)
+
+The wide-view inference scripts share a `--dataset` preset layer so the same
+pipeline runs on nuScenes, Lyft (`lyft1920`, `lyft1224`) and DDAD. The preset
+supplies the data root, scene list, context/render cameras, ego-car mask naming
+and the multi-frame extrinsics convention. Any explicitly passed data flag
+(`--data-root`, `--scene-list`, `--cameras`, `--render-camera`,
+`--car-mask-root`, `--output-dir`) still wins; unset flags fall back to the
+preset. `nuscenes` is the default and is byte-identical to the previous
+behaviour.
+
+| `--dataset` | Data root | Scene list | Cameras (render) | Ego-car masks | Single extr. | Multi extr. | Default input |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `nuscenes` (default) | `datasets/nuscenes/processed_10Hz/trainval2` | `nuScenes_Val2.txt` | `5,4,3` (`5`) | `datasets/nuscenes/processed_10Hz/nuscenes_mask/CAM_*_mask.png` | `cam2ego` | `per_frame` | `256x448` (model) |
+| `lyft1920` | `datasets/lyft/lyft_val1920_3cams` | `lyft_val1920.txt` | `5,4,3` (`5`) | `<root>/ego_car_masks/<cam>.jpg` | `cam2ego` | `per_frame` | `256x448` (model) |
+| `lyft1224` | `datasets/lyft/lyft_val1224_3cams` | `lyft_val1224.txt` | `5,4,3` (`5`) | `<root>/ego_car_masks/<cam>.jpg` | `cam2ego` | `per_frame` | `384x448` (aspect) |
+| `ddad` | `datasets/ddad/valid` | `valid.txt` | `5,4,3` (`5`) | `<root>/<scene>/ego_car_masks/<cam>.jpg` | `cam2ego` | `compose` | `256x448` (aspect) |
+
+Default output dirs become `outputs/<dataset>_wide` (single-frame) and
+`outputs/<dataset>_wide_multiframes` (multi-frame), so nuScenes stays
+`outputs/nuscenes_wide` / `outputs/nuscenes_wide_multiframes`.
+
+### Layout differences
+
+- **Lyft** (`lyft_val1920_3cams`, `lyft_val1224_3cams`): cameras `3,4,5`; per
+  scene `images/{frame}_{cam}.jpg`, `intrinsics/{cam}.txt`,
+  `cam2ego_extrinsics/{cam}.txt`, `extrinsics/{frame}_{cam}.txt`,
+  `ego_pose/{frame}.txt`. Ego-car masks live at the **split root** in
+  `ego_car_masks/<cam>.jpg` (`0.jpg`..`5.jpg`); no sky masks are used.
+- **DDAD** (`datasets/ddad/valid`): cameras `0..5` (we use `5,4,3`); per scene
+  `images/{frame}_{cam}.jpg`, `intrinsics/{cam}.txt`,
+  `cam2ego_extrinsics/{cam}.txt`, `ego_pose/{frame}.txt`, `sky_masks/` and a
+  **per-scene** `ego_car_masks/<cam>.jpg`. There is **no** `extrinsics/`
+  directory.
+
+### DDAD extrinsics must be composed
+
+Because DDAD has no `extrinsics/{frame}_{cam}.txt`, multi-frame inference composes
+the global OpenCV camera-to-world matrix:
+
+```
+C2W = ego_pose/{frame}.txt @ cam2ego_extrinsics/{cam}.txt
+```
+
+`--extrinsics-source` (multi-frame) defaults to `auto`: it resolves to
+`per_frame` on nuScenes/Lyft and to `compose` on DDAD. Pass `per_frame` or
+`compose` explicitly to force a mode; a missing input file is a hard error (on
+DDAD, forcing `per_frame` names the missing `extrinsics/...` path and points back
+at `compose`). The single-frame path always uses the static `cam2ego` rig
+(`--extrinsics-source {cam2ego,per_frame}`), unchanged.
+
+### Ego-car masks
+
+Mask polarity, resize/crop transform and the masking policy are the **same** as
+nuScenes (documented in the two "Ego-car masking" subsections): the mask is
+loaded as PIL `L`, NEAREST-resized to the scaled size, centre-cropped with the
+images' plan, and black (`<128`) pixels are removed while white (`>=128`) is
+kept. Each camera's mask is applied to its own view except the render camera,
+which is preserved by default; `--mask-render-view` masks it too and
+`--disable-car-mask` disables masking. The only difference is the file location
+(Lyft split-level `<cam>.jpg`, DDAD per-scene `<scene>/ego_car_masks/<cam>.jpg`).
+The masks' source resolution must match the images'.
+
+### Commands
+
+```bash
+# Single-frame, Lyft 1920x1080 (defaults: model 256x448, width factor 3x,
+# cameras 5,4,3, render camera 5; cams 4/3 masked, cam 5 preserved).
+python scripts/inference_nuscenes_wide.py --dataset lyft1920 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/lyft1920_wide
+
+# Multi-frame, Lyft 1920x1080 (3 consecutive frames, newest rendered).
+python scripts/inference_nuscenes_wide_multiframes.py --dataset lyft1920 \
+  --num-frames 3 --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/lyft1920_wide_multiframes
+
+# Single-frame, Lyft 1224x1024.
+python scripts/inference_nuscenes_wide.py --dataset lyft1224 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/lyft1224_wide
+
+# Single-frame, DDAD (composed extrinsics are only needed by multi-frame).
+python scripts/inference_nuscenes_wide.py --dataset ddad \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/ddad_wide
+
+# Multi-frame, DDAD: --extrinsics-source auto resolves to compose
+# (ego_pose @ cam2ego) because DDAD has no extrinsics/ directory.
+python scripts/inference_nuscenes_wide_multiframes.py --dataset ddad \
+  --num-frames 3 --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/ddad_wide_multiframes
+```
+
+Add `--dry-run` to any command to validate paths, masks and extrinsics without a
+GPU.
+
+### Native sizes and derived input height
+
+Native image sizes are Lyft 1920x1080 (`lyft1920`), Lyft 1224x1024
+(`lyft1224`) and DDAD 1936x1216; the generic aspect-preserving resize + centre
+crop plan handles them without special cases.
+
+The model input size follows the `--model` preset (`256x448` by default). The
+width is resolved exactly as before (preset width, then `--input-size` width,
+then `--width`) and floored to the effective patch size. The **height** depends
+on the dataset's `input_height_policy`:
+
+- `nuscenes` and `lyft1920` use `model`: the height is the model preset height,
+  so the default input stays `256x448` (or `448x768` with `--model 448x768`)
+  regardless of the width factor.
+- `lyft1224` and `ddad` use `aspect`: when no explicit height is given, the
+  height is derived at the resolved width from the native aspect ratio,
+  `h = nearest_multiple_of_patch(native_h * width / native_w)`, so the native
+  aspect is preserved at the chosen width while picking the closest
+  model-usable height.
+
+Explicit heights always win: `--height` (or the height of an explicit
+`--input-size`) is honored and floored to the patch size, skipping the
+derivation.
+
+Example derived inputs at the effective patch size 64:
+
+| Dataset | Width | Input (HxW) | Wide output (factor 3) |
+| --- | --- | --- | --- |
+| `lyft1224` | 448 (default) | `384x448` | `384x1344` |
+| `ddad` | 448 (default) | `256x448` | `256x1344` |
+| `lyft1224` | 768 (`--model 448x768` / `--width 768`) | `640x768` | `640x2304` |
+| `ddad` | 768 (`--model 448x768` / `--width 768`) | `512x768` | `512x2304` |
+| any | explicit `--input-size 448x768` | `448x768` | `448x2304` |
+
+The output width factor stays the nuScenes-consistent default of `3x`
+(`--width-factor`; an input `256x448` renders `256x1344`).
 
 ## Speed benchmark
 
@@ -859,7 +997,10 @@ latency in milliseconds and throughput as `1000 / mean` FPS.
 ### Commands
 
 The four combinations (default model `256x448`; the `448x768` preset renders at
-its native input size):
+its native input size). The default width factor is `3`, so `256x448` renders
+`256x1344` and `448x768` renders `448x2304`; aspect-derived datasets
+(`lyft1224`, `ddad`) derive their input height at the chosen width (see the
+[Lyft and DDAD](#lyft-and-ddad-dataset-presets) section).
 
 ```bash
 # single frame, 256x448
@@ -880,6 +1021,12 @@ python scripts/benchmark_nuscenes_wide.py \
 # multi frame (3 consecutive frames), 448x768
 python scripts/benchmark_nuscenes_wide.py \
   --mode multi --model 448x768 --input-size 448x768 --num-frames 3 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
+
+# any dataset preset works too (masks and extrinsics are resolved from it):
+python scripts/benchmark_nuscenes_wide.py --dataset lyft1920 --mode multi \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
+python scripts/benchmark_nuscenes_wide.py --dataset ddad --mode multi \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
 ```
 

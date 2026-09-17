@@ -238,6 +238,9 @@ class ParserDefaultsTest(unittest.TestCase):
 
     def setUp(self):
         self.args = mf.build_arg_parser().parse_args([])
+        # Dataset-derived fields default to None and are filled from the
+        # selected --dataset preset (nuscenes by default).
+        mf.resolve_dataset_defaults(self.args)
 
     def test_model_and_input_defaults(self):
         self.assertEqual(self.args.model, "256x448")
@@ -265,7 +268,7 @@ class ParserDefaultsTest(unittest.TestCase):
     def test_camera_defaults(self):
         self.assertEqual(self.args.cameras, "5,4,3")
         self.assertEqual(self.args.render_camera, 5)
-        self.assertEqual(self.args.width_factor, 2.0)
+        self.assertEqual(self.args.width_factor, 3.0)
 
     def test_scene_list_default(self):
         self.assertEqual(
@@ -337,11 +340,198 @@ class ParserDefaultsTest(unittest.TestCase):
 
 
 class ExtrinsicsSourceTest(unittest.TestCase):
-    """The multi-frame CLI must not expose a cam2ego A/B switch."""
+    """The multi-frame CLI exposes auto/per_frame/compose; auto uses the preset."""
 
-    def test_no_extrinsics_source_flag(self):
+    def test_extrinsics_source_flag_defaults_to_auto(self):
         args = mf.build_arg_parser().parse_args([])
-        self.assertFalse(hasattr(args, "extrinsics_source"))
+        self.assertEqual(args.extrinsics_source, "auto")
+        self.assertEqual(mf.DEFAULT_MULTI_EXTRINSICS_SOURCE, "auto")
+        self.assertEqual(
+            mf.MULTI_EXTRINSICS_SOURCE_CHOICES, ("auto", "per_frame", "compose")
+        )
+
+    def test_auto_resolves_to_preset_multi_source(self):
+        for name, expected in (
+            ("nuscenes", "per_frame"),
+            ("lyft1920", "per_frame"),
+            ("lyft1224", "per_frame"),
+            ("ddad", "compose"),
+        ):
+            with self.subTest(dataset=name):
+                self.assertEqual(
+                    mf.resolve_multi_extrinsics_mode("auto", mf.DATASETS[name]),
+                    expected,
+                )
+
+    def test_explicit_mode_wins(self):
+        preset = mf.DATASETS["nuscenes"]
+        self.assertEqual(mf.resolve_multi_extrinsics_mode("compose", preset), "compose")
+        self.assertEqual(
+            mf.resolve_multi_extrinsics_mode("per_frame", preset), "per_frame"
+        )
+
+    def test_parser_rejects_unknown_source(self):
+        with self.assertRaises(SystemExit):
+            mf.build_arg_parser().parse_args(["--extrinsics-source", "global"])
+
+
+class ComposeExtrinsicsTest(unittest.TestCase):
+    """``compose`` builds ego_pose @ cam2ego and fails loudly when incomplete."""
+
+    @staticmethod
+    def _write(path, matrix):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savetxt(path, np.asarray(matrix, dtype=np.float64).reshape(4, 4))
+
+    def test_compose_equals_ego_pose_times_cam2ego(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene = Path(tmp) / "000"
+            ego = np.array(
+                [[0, -1, 0, 10], [1, 0, 0, 20], [0, 0, 1, 30], [0, 0, 0, 1]],
+                dtype=np.float64,
+            )
+            rig = np.array(
+                [[1, 0, 0, 1], [0, 1, 0, 2], [0, 0, 1, 3], [0, 0, 0, 1]],
+                dtype=np.float64,
+            )
+            self._write(scene / "ego_pose" / "000.txt", ego)
+            self._write(scene / "cam2ego_extrinsics" / "5.txt", rig)
+
+            got = mf.read_view_extrinsics(scene, "000", 5, "compose")
+            np.testing.assert_allclose(got, ego @ rig, rtol=1e-9, atol=1e-9)
+
+            ego_path, rig_path = mf.compose_extrinsics_paths(scene, "000", 5)
+            self.assertEqual(ego_path, scene / "ego_pose" / "000.txt")
+            self.assertEqual(rig_path, scene / "cam2ego_extrinsics" / "5.txt")
+
+    def test_per_frame_reads_direct_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene = Path(tmp) / "000"
+            matrix = np.eye(4)
+            matrix[0, 3] = 7.5
+            self._write(scene / "extrinsics" / "000_5.txt", matrix)
+            got = mf.read_view_extrinsics(scene, "000", 5, "per_frame")
+            np.testing.assert_allclose(got, matrix, rtol=1e-9, atol=1e-9)
+
+    def test_missing_compose_inputs_fail_loudly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene = Path(tmp) / "000"
+            with self.assertRaises(FileNotFoundError) as ctx:
+                mf.read_view_extrinsics(scene, "000", 5, "compose")
+            message = str(ctx.exception)
+            self.assertIn("ego_pose", message)
+            self.assertIn("cam2ego_extrinsics", message)
+
+    def test_missing_per_frame_point_to_compose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene = Path(tmp) / "000"
+            with self.assertRaises(FileNotFoundError) as ctx:
+                mf.read_view_extrinsics(scene, "000", 5, "per_frame")
+            message = str(ctx.exception)
+            self.assertIn("extrinsics/000_5.txt", message)
+            self.assertIn("compose", message)
+
+    def test_unknown_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            mf.read_view_extrinsics(Path("/scene"), "000", 5, "global")
+
+    def test_load_window_inputs_compose(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scene = Path(tmp) / "000"
+            for sub in ("images", "intrinsics", "ego_pose", "cam2ego_extrinsics"):
+                (scene / sub).mkdir(parents=True)
+            for frame in ("000", "001"):
+                for cam in (5, 4, 3):
+                    Image.new("RGB", (4, 4), (1, 2, 3)).save(
+                        scene / "images" / f"{frame}_{cam}.jpg"
+                    )
+                    (scene / "intrinsics" / f"{cam}.txt").write_text(
+                        "1 1 2 2 0 0 0 0 1"
+                    )
+            for cam in (5, 4, 3):
+                rig = np.eye(4)
+                rig[0, 3] = cam
+                self._write(scene / "cam2ego_extrinsics" / f"{cam}.txt", rig)
+            for frame_index, frame in enumerate(("000", "001")):
+                ego = np.eye(4)
+                ego[1, 3] = 100.0 + frame_index
+                self._write(scene / "ego_pose" / f"{frame}.txt", ego)
+
+            inputs = mf.load_window_inputs(
+                scene,
+                "000",
+                ("000", "001"),
+                (5, 4, 3),
+                5,
+                (4, 4),
+                (4, 4),
+                extrinsics_mode="compose",
+            )
+            # Frame-major: (000,c5),(000,c4),(000,c3),(001,c5),(001,c4),(001,c3).
+            for view, (frame_index, cam) in enumerate(
+                [(0, 5), (0, 4), (0, 3), (1, 5), (1, 4), (1, 3)]
+            ):
+                np.testing.assert_allclose(
+                    inputs.extrinsics[view, :3, 3],
+                    [cam, 100.0 + frame_index, 0.0],
+                    rtol=0,
+                    atol=1e-6,
+                )
+
+
+class MultiDatasetDefaultsTest(unittest.TestCase):
+    """Multi-frame defaults follow --dataset (output dir gets its own suffix)."""
+
+    def test_output_dir_defaults(self):
+        for name, expected in (
+            ("nuscenes", "outputs/nuscenes_wide_multiframes"),
+            ("lyft1920", "outputs/lyft1920_wide_multiframes"),
+            ("lyft1224", "outputs/lyft1224_wide_multiframes"),
+            ("ddad", "outputs/ddad_wide_multiframes"),
+        ):
+            with self.subTest(dataset=name):
+                args = mf.build_arg_parser().parse_args(["--dataset", name])
+                mf.resolve_dataset_defaults(args)
+                self.assertEqual(args.output_dir, expected)
+                self.assertEqual(args.cameras, "5,4,3")
+                self.assertEqual(args.render_camera, 5)
+                self.assertEqual(args.extrinsics_source, "auto")
+
+    def test_ddad_dataset_paths(self):
+        args = mf.build_arg_parser().parse_args(["--dataset", "ddad"])
+        mf.resolve_dataset_defaults(args)
+        self.assertEqual(args.data_root, "datasets/ddad/valid")
+        self.assertEqual(args.scene_list, "datasets/ddad/valid/valid.txt")
+        self.assertEqual(args.car_mask_root, "datasets/ddad/valid")
+
+    def test_shared_preset_table_alias(self):
+        self.assertIs(mf.DATASETS, mf.wide.DATASETS)
+        self.assertEqual(mf.DEFAULT_DATASET, "nuscenes")
+
+    def test_auto_resolves_ddad_compose(self):
+        preset = mf.DATASETS["ddad"]
+        self.assertEqual(mf.resolve_multi_extrinsics_mode("auto", preset), "compose")
+        self.assertEqual(
+            mf.resolve_multi_extrinsics_mode("per_frame", preset), "per_frame"
+        )
+
+    def test_shared_derived_input_resolution(self):
+        model = mf.wide.MODEL_PRESETS["256x448"]
+        args = mf.build_arg_parser().parse_args(["--dataset", "ddad"])
+        preset = mf.resolve_dataset_defaults(args)
+        self.assertEqual(
+            mf.wide.resolve_dataset_input_hw(args, model, preset, 64), (256, 448)
+        )
+        args = mf.build_arg_parser().parse_args(["--dataset", "lyft1224"])
+        preset = mf.resolve_dataset_defaults(args)
+        self.assertEqual(
+            mf.wide.resolve_dataset_input_hw(args, model, preset, 64), (384, 448)
+        )
+
+    def test_default_width_factor_three(self):
+        self.assertEqual(mf.DEFAULT_WIDTH_FACTOR, 3.0)
 
 
 class ComposeLocalMvMatchTest(unittest.TestCase):

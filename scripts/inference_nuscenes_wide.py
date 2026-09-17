@@ -8,6 +8,14 @@ frame it builds the DepthSplat encoder/decoder directly from the repository
 configuration, reconstructs Gaussians from cameras ``[5, 4, 3]`` and renders a
 horizontally widened image from camera ``5``.
 
+Dataset presets
+---------------
+``--dataset {nuscenes,lyft1920,lyft1224,ddad}`` selects the data root, scene
+list, cameras, ego-car mask naming and the extrinsics convention; unset data
+flags fall back to the preset and explicit flags win.  ``nuscenes`` is the
+default and keeps the previous behaviour.  See ``DATASETS`` and the README
+section "Lyft and DDAD (dataset presets)".
+
 Rendering convention
 --------------------
 The context images are resized (aspect preserving) and centre-cropped to the
@@ -71,15 +79,112 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-DEFAULT_DATA_ROOT = Path("datasets/nuscenes/processed_10Hz/trainval2")
-DEFAULT_SCENE_LIST_NAME = "nuScenes_Val2.txt"
+@dataclass(frozen=True)
+class DatasetPreset:
+    """Paths, cameras, mask and extrinsics conventions for one dataset split.
+
+    ``mask_kind`` selects how :func:`camera_mask_path` resolves a camera mask:
+    ``nuscenes`` uses the ``CAMERA_MASK_FILES`` name mapping under ``mask_root``,
+    ``lyft`` a dataset-level ``<mask_root>/{cam}.{mask_ext}``, and ``ddad`` a
+    per-scene ``<mask_root>/<scene>/ego_car_masks/{cam}.{mask_ext}``.
+    ``multi_extrinsics`` is the multi-frame default: ``per_frame`` reads
+    ``extrinsics/{frame}_{cam}.txt`` while ``compose`` builds
+    ``ego_pose/{frame}.txt @ cam2ego_extrinsics/{cam}.txt`` (DDAD has no
+    ``extrinsics/`` directory).
+
+    ``input_height_policy`` controls the default input height when the user does
+    not pass an explicit height: ``"model"`` keeps the model preset height,
+    while ``"aspect"`` derives the height at the resolved width from
+    ``native_hw`` (see :func:`derive_input_height`) so the native aspect ratio
+    is preserved at that width.
+    """
+
+    name: str
+    data_root: str
+    scene_list_name: str
+    cameras: tuple[int, ...]
+    render_camera: int
+    mask_kind: str
+    mask_root: str
+    mask_ext: str
+    single_extrinsics: str
+    multi_extrinsics: str
+    input_height_policy: str
+    native_hw: tuple[int, int]
+
+
+DATASETS: dict[str, DatasetPreset] = {
+    "nuscenes": DatasetPreset(
+        name="nuscenes",
+        data_root="datasets/nuscenes/processed_10Hz/trainval2",
+        scene_list_name="nuScenes_Val2.txt",
+        cameras=(5, 4, 3),
+        render_camera=5,
+        mask_kind="nuscenes",
+        mask_root="datasets/nuscenes/processed_10Hz/nuscenes_mask",
+        mask_ext="png",
+        single_extrinsics="cam2ego",
+        multi_extrinsics="per_frame",
+        input_height_policy="model",
+        native_hw=(900, 1600),
+    ),
+    "lyft1920": DatasetPreset(
+        name="lyft1920",
+        data_root="datasets/lyft/lyft_val1920_3cams",
+        scene_list_name="lyft_val1920.txt",
+        cameras=(5, 4, 3),
+        render_camera=5,
+        mask_kind="lyft",
+        mask_root="datasets/lyft/lyft_val1920_3cams/ego_car_masks",
+        mask_ext="jpg",
+        single_extrinsics="cam2ego",
+        multi_extrinsics="per_frame",
+        input_height_policy="model",
+        native_hw=(1080, 1920),
+    ),
+    "lyft1224": DatasetPreset(
+        name="lyft1224",
+        data_root="datasets/lyft/lyft_val1224_3cams",
+        scene_list_name="lyft_val1224.txt",
+        cameras=(5, 4, 3),
+        render_camera=5,
+        mask_kind="lyft",
+        mask_root="datasets/lyft/lyft_val1224_3cams/ego_car_masks",
+        mask_ext="jpg",
+        single_extrinsics="cam2ego",
+        multi_extrinsics="per_frame",
+        input_height_policy="aspect",
+        native_hw=(1024, 1224),
+    ),
+    "ddad": DatasetPreset(
+        name="ddad",
+        data_root="datasets/ddad/valid",
+        scene_list_name="valid.txt",
+        cameras=(5, 4, 3),
+        render_camera=5,
+        mask_kind="ddad",
+        # DDAD ego-car masks are per scene: <mask_root>/<scene>/ego_car_masks/.
+        mask_root="datasets/ddad/valid",
+        mask_ext="jpg",
+        single_extrinsics="cam2ego",
+        multi_extrinsics="compose",
+        input_height_policy="aspect",
+        native_hw=(1216, 1936),
+    ),
+}
+
+DEFAULT_DATASET = "nuscenes"
+# nuScenes defaults are derived from the preset table so they stay
+# byte-identical to the pre-dataset behaviour.
+DEFAULT_DATA_ROOT = Path(DATASETS[DEFAULT_DATASET].data_root)
+DEFAULT_SCENE_LIST_NAME = DATASETS[DEFAULT_DATASET].scene_list_name
 DEFAULT_SCENE_LIST_PATH = DEFAULT_DATA_ROOT / DEFAULT_SCENE_LIST_NAME
 DEFAULT_MAX_FRAMES = -1  # -1 == process every valid frame of every selected scene
-DEFAULT_OUTPUT_DIR = Path("outputs/nuscenes_wide")
+DEFAULT_OUTPUT_DIR = Path(f"outputs/{DATASETS[DEFAULT_DATASET].name}_wide")
 
-DEFAULT_CAMERAS = (5, 4, 3)
-DEFAULT_RENDER_CAMERA = 5
-DEFAULT_WIDTH_FACTOR = 2.0
+DEFAULT_CAMERAS = DATASETS[DEFAULT_DATASET].cameras
+DEFAULT_RENDER_CAMERA = DATASETS[DEFAULT_DATASET].render_camera
+DEFAULT_WIDTH_FACTOR = 3.0
 
 # How OpenCV camera-to-world extrinsics are obtained.  ``cam2ego`` reads the
 # static per-camera rig transform ``cam2ego_extrinsics/{cam}.txt`` (ego is the
@@ -92,7 +197,8 @@ EXTRINSICS_SOURCE_CHOICES = ("cam2ego", "per_frame")
 # Per-camera nuScenes ego-car masks.  Camera ids 0..5 are, in order, CAM_FRONT,
 # CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK_LEFT, CAM_BACK_RIGHT, CAM_BACK; the
 # default cameras 5,4,3 therefore map to CAM_BACK, CAM_BACK_RIGHT, CAM_BACK_LEFT.
-DEFAULT_CAR_MASK_ROOT = Path("datasets/nuscenes/processed_10Hz/nuscenes_mask")
+# Lyft/DDAD instead name masks by bare camera id (see ``DatasetPreset.mask_kind``).
+DEFAULT_CAR_MASK_ROOT = Path(DATASETS[DEFAULT_DATASET].mask_root)
 CAMERA_MASK_FILES: dict[int, str] = {
     0: "CAM_FRONT_mask.png",
     1: "CAM_FRONT_LEFT_mask.png",
@@ -319,6 +425,80 @@ def round_hw_to_multiple(
     return (max(multiple, h // multiple * multiple), max(multiple, w // multiple * multiple))
 
 
+def derive_input_height(
+    native_hw: tuple[int, int], target_width: int, patch_size: int
+) -> int:
+    """Nearest model-usable height preserving the native aspect at ``target_width``.
+
+    ``raw = native_h * target_width / native_w`` is rounded to the *nearest*
+    multiple of ``patch_size`` (round-half-up) and clamped to at least one patch
+    step.  This keeps the native aspect ratio at the chosen input width while
+    picking the closest height that the effective-patch-size constraint allows.
+    """
+    native_h, native_w = int(native_hw[0]), int(native_hw[1])
+    target_width = int(target_width)
+    patch_size = int(patch_size)
+    if native_h <= 0 or native_w <= 0:
+        raise ValueError(f"Invalid native shape {native_hw}.")
+    if target_width <= 0:
+        raise ValueError(f"target_width must be positive, got {target_width}.")
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be positive, got {patch_size}.")
+    raw = native_h * target_width / native_w
+    steps = int(raw / patch_size + 0.5)  # round half up to the nearest step
+    return max(patch_size, steps * patch_size)
+
+
+def resolve_dataset_input_hw(
+    args,
+    model_preset: ModelPreset,
+    dataset_preset: DatasetPreset,
+    patch_size: int,
+) -> tuple[int, int]:
+    """Resolve the actual model input ``(height, width)`` for a dataset preset.
+
+    Width precedence (then floored to a multiple of ``patch_size``): the
+    ``--model`` preset width, then an explicit ``--input-size`` width, then
+    ``--width``.  Height precedence:
+
+    1. An explicit user height wins: ``--height`` or the height of an explicit
+       ``--input-size`` (then floored to ``patch_size``, as before).
+    2. Otherwise, if ``dataset_preset.input_height_policy == "aspect"``, derive
+       the height from the resolved width and ``native_hw`` with
+       :func:`derive_input_height`.
+    3. Otherwise (``"model"``) keep the model preset height (existing behaviour).
+
+    ``round_hw_to_multiple`` (floor) is still used for explicit sizes; only the
+    aspect derivation uses nearest rounding.
+    """
+    patch_size = int(patch_size)
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be positive, got {patch_size}.")
+
+    width = int(model_preset.width)
+    if args.input_size is not None:
+        width = int(args.input_size[1])
+    if getattr(args, "width", None) is not None:
+        width = int(args.width)
+    width = max(patch_size, width // patch_size * patch_size)
+
+    explicit_height = None
+    if getattr(args, "height", None) is not None:
+        explicit_height = int(args.height)
+    elif args.input_size is not None:
+        explicit_height = int(args.input_size[0])
+
+    if explicit_height is not None:
+        height = max(patch_size, explicit_height // patch_size * patch_size)
+    elif dataset_preset.input_height_policy == "aspect":
+        height = derive_input_height(dataset_preset.native_hw, width, patch_size)
+    else:
+        height = max(
+            patch_size, int(model_preset.height) // patch_size * patch_size
+        )
+    return (height, width)
+
+
 def plan_resize_and_crop(
     src_hw: tuple[int, int], dst_hw: tuple[int, int]
 ) -> ResizeCropPlan:
@@ -505,19 +685,42 @@ def save_rgb(tensor_chw, path: Path, quality: int = 95) -> None:
 # ---------------------------------------------------------------------------
 
 
-def camera_mask_path(mask_root, cam: int) -> Path:
-    """Path of ``cam``'s ego-car mask under ``mask_root``.
+def camera_mask_path(
+    mask_root, cam: int, kind: str = "nuscenes", scene=None, ext: str = "png"
+) -> Path:
+    """Path of ``cam``'s ego-car mask under ``mask_root`` for a dataset ``kind``.
 
-    Raises ``KeyError`` for a camera without a nuScenes mask mapping (only
-    0..5 exist); there is deliberately no fallback mask.
+    * ``nuscenes``: ``<mask_root>/CAM_*_mask.png`` (the ``CAMERA_MASK_FILES``
+      mapping; raises ``KeyError`` for an unmapped camera).
+    * ``lyft``: dataset-level ``<mask_root>/{cam}.{ext}``.
+    * ``ddad``: per-scene ``<mask_root>/<scene>/ego_car_masks/{cam}.{ext}``
+      (``scene`` is required).
+
+    There is deliberately no fallback mask.
     """
     cam = int(cam)
-    if cam not in CAMERA_MASK_FILES:
-        raise KeyError(
-            f"No ego-car mask is defined for camera {cam}; known nuScenes "
-            f"cameras are {sorted(CAMERA_MASK_FILES)}."
-        )
-    return Path(mask_root) / CAMERA_MASK_FILES[cam]
+    root = Path(mask_root)
+    kind = "nuscenes" if kind is None else str(kind)
+    if kind == "nuscenes":
+        if cam not in CAMERA_MASK_FILES:
+            raise KeyError(
+                f"No ego-car mask is defined for camera {cam}; known nuScenes "
+                f"cameras are {sorted(CAMERA_MASK_FILES)}."
+            )
+        return root / CAMERA_MASK_FILES[cam]
+    if kind == "lyft":
+        return root / f"{cam}.{ext}"
+    if kind == "ddad":
+        if scene is None:
+            raise ValueError(
+                "DDAD ego-car masks are stored per scene; camera_mask_path needs "
+                "scene=<scene id> (e.g. <mask_root>/<scene>/ego_car_masks/)."
+            )
+        return root / str(scene) / "ego_car_masks" / f"{cam}.{ext}"
+    raise ValueError(
+        f"Unknown ego-car mask kind {kind!r}; expected one of "
+        "'nuscenes', 'lyft', 'ddad'."
+    )
 
 
 def load_resized_keep_mask(path, plan: ResizeCropPlan) -> np.ndarray:
@@ -551,18 +754,25 @@ def load_resized_keep_mask(path, plan: ResizeCropPlan) -> np.ndarray:
 
 
 def load_camera_keep_masks(
-    mask_root, cameras: Sequence[int], plan: ResizeCropPlan
+    mask_root,
+    cameras: Sequence[int],
+    plan: ResizeCropPlan,
+    kind: str = "nuscenes",
+    scene=None,
+    ext: str = "png",
 ) -> dict[int, np.ndarray]:
     """Load and resize every selected camera's keep mask exactly once.
 
-    Fails loudly (``FileNotFoundError``/``ValueError``) when a required mask is
-    missing or has the wrong source resolution; masking never silently falls
-    back to all-ones.
+    ``kind``/``scene``/``ext`` select the dataset's mask naming (see
+    :func:`camera_mask_path`); the defaults keep the nuScenes behaviour and
+    existing callers unchanged.  Fails loudly (``FileNotFoundError``/
+    ``ValueError``) when a required mask is missing or has the wrong source
+    resolution; masking never silently falls back to all-ones.
     """
     masks: dict[int, np.ndarray] = {}
     for cam in cameras:
         cam = int(cam)
-        path = camera_mask_path(mask_root, cam)
+        path = camera_mask_path(mask_root, cam, kind=kind, scene=scene, ext=ext)
         if not path.is_file():
             raise FileNotFoundError(
                 f"Missing ego-car mask for camera {cam}: {path}. Masking is "
@@ -800,17 +1010,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     data = parser.add_argument_group("data")
     data.add_argument(
+        "--dataset",
+        choices=sorted(DATASETS),
+        default=DEFAULT_DATASET,
+        help=(
+            "Dataset preset selecting paths, cameras, mask naming and extrinsics "
+            "conventions. Unset data flags fall back to the preset; explicit "
+            "flags win. Presets: " + ", ".join(sorted(DATASETS)) + "."
+        ),
+    )
+    data.add_argument(
         "--data-root",
-        default=str(DEFAULT_DATA_ROOT),
-        help="Directory containing the scene folders (relative to repo root).",
+        default=None,
+        help=(
+            "Directory containing the scene folders (relative to repo root). "
+            "Default: the --dataset preset data root (e.g. "
+            f"{DATASETS[DEFAULT_DATASET].data_root})."
+        ),
     )
     data.add_argument(
         "--scene-list",
-        default=str(DEFAULT_SCENE_LIST_PATH),
+        default=None,
         help=(
-            "Scene id list (one scene id per line). Defaults to "
-            "<data-root>/" + DEFAULT_SCENE_LIST_NAME + ", i.e. "
-            f"{DEFAULT_SCENE_LIST_PATH}. Every scene in the list is processed."
+            "Scene id list (one scene id per line). Default: "
+            "<data-root>/<preset scene list name> (e.g. "
+            f"{DEFAULT_SCENE_LIST_PATH}). Every scene in the list is processed."
         ),
     )
     data.add_argument(
@@ -834,15 +1058,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     data.add_argument(
         "--cameras",
-        default=",".join(str(c) for c in DEFAULT_CAMERAS),
-        help="Comma separated context camera ids (order preserved).",
+        default=None,
+        help=(
+            "Comma separated context camera ids (order preserved). Default: the "
+            f"--dataset preset cameras ({','.join(str(c) for c in DEFAULT_CAMERAS)} "
+            "for nuscenes and lyft/ddad)."
+        ),
     )
     data.add_argument(
         "--extrinsics-source",
         choices=EXTRINSICS_SOURCE_CHOICES,
-        default=DEFAULT_EXTRINSICS_SOURCE,
+        default=None,
         help=(
-            "OpenCV camera-to-world extrinsics to use. 'cam2ego' (default) "
+            "OpenCV camera-to-world extrinsics to use. 'cam2ego' (preset default) "
             "reads the static per-camera rig transform "
             "cam2ego_extrinsics/{cam}.txt directly (the per-frame ego frame is "
             "the world), giving frame-independent reconstruction. 'per_frame' "
@@ -853,17 +1081,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     data.add_argument(
         "--car-mask-root",
-        default=str(DEFAULT_CAR_MASK_ROOT),
+        default=None,
         help=(
-            "Directory with the per-camera nuScenes ego-car masks "
-            "(CAM_FRONT_mask.png, CAM_FRONT_LEFT_mask.png, CAM_FRONT_RIGHT_mask.png, "
-            "CAM_BACK_LEFT_mask.png, CAM_BACK_RIGHT_mask.png, CAM_BACK_mask.png for "
-            "cameras 0..5). Black (<128) pixels are removed and white (>=128) kept, "
-            "transformed with exactly the same resize/crop plan as the images. "
-            "By default each context camera's mask is applied to its own view, "
-            "except the render camera which is fully preserved: for cameras 5,4,3 "
-            "with render camera 5, cameras 4 and 3 are masked. A missing mask for "
-            "any selected camera is a hard error."
+            "Directory with the per-camera ego-car masks. Default: the --dataset "
+            "preset mask root. Naming follows the dataset: nuScenes uses "
+            "CAM_*_mask.png under the root; lyft uses <root>/<cam>.jpg; ddad uses "
+            "the per-scene <root>/<scene>/ego_car_masks/<cam>.jpg. Black (<128) "
+            "pixels are removed and white (>=128) kept, transformed with exactly "
+            "the same resize/crop plan as the images. By default each context "
+            "camera's mask is applied to its own view, except the render camera "
+            "which is fully preserved: for cameras 5,4,3 with render camera 5, "
+            "cameras 4 and 3 are masked. A missing mask for any selected camera "
+            "is a hard error."
         ),
     )
     data.add_argument(
@@ -962,8 +1191,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--render-camera",
         type=int,
-        default=DEFAULT_RENDER_CAMERA,
-        help="Camera id rendered in the wide view.",
+        default=None,
+        help=(
+            "Camera id rendered in the wide view. Default: the --dataset preset "
+            f"render camera ({DEFAULT_RENDER_CAMERA})."
+        ),
     )
     render.add_argument(
         "--width-factor",
@@ -977,8 +1209,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     out = parser.add_argument_group("output")
     out.add_argument(
         "--output-dir",
-        default=str(DEFAULT_OUTPUT_DIR),
-        help="Output root directory.",
+        default=None,
+        help=(
+            "Output root directory. Default: outputs/<dataset>_wide (i.e. "
+            f"{DEFAULT_OUTPUT_DIR} for nuscenes)."
+        ),
     )
     out.add_argument(
         "--save-inputs",
@@ -1020,6 +1255,38 @@ def parse_cameras(text: str) -> tuple[int, ...]:
 def resolve_local(path: str, base: Path = REPO_ROOT) -> Path:
     p = Path(path).expanduser()
     return p if p.is_absolute() else (base / p)
+
+
+def resolve_dataset_defaults(args, multiframe: bool = False) -> DatasetPreset:
+    """Fill unset (``None``) dataset-derived CLI fields from ``args.dataset``.
+
+    Explicit flags always win: only ``None`` fields are populated.  The scene
+    list is built from the (possibly explicit) data root so that overriding only
+    ``--data-root`` still reads that root's preset scene list.  Returns the
+    selected :class:`DatasetPreset`.  ``multiframe`` only changes the default
+    output directory suffix (``outputs/{dataset}_wide`` vs
+    ``outputs/{dataset}_wide_multiframes``).
+    """
+    preset = DATASETS[args.dataset]
+    if getattr(args, "data_root", None) is None:
+        args.data_root = preset.data_root
+    if getattr(args, "scene_list", None) is None:
+        args.scene_list = str(Path(args.data_root) / preset.scene_list_name)
+    if getattr(args, "cameras", None) is None:
+        args.cameras = ",".join(str(cam) for cam in preset.cameras)
+    if getattr(args, "render_camera", None) is None:
+        args.render_camera = preset.render_camera
+    if getattr(args, "car_mask_root", None) is None:
+        args.car_mask_root = preset.mask_root
+    if getattr(args, "output_dir", None) is None:
+        suffix = "_wide_multiframes" if multiframe else "_wide"
+        args.output_dir = f"outputs/{preset.name}{suffix}"
+    # Single-frame ``--extrinsics-source`` has no ``auto``; when unset it takes
+    # the preset's single-frame source.  The multi-frame CLI defaults it to
+    # "auto", which is left untouched and resolved separately.
+    if getattr(args, "extrinsics_source", None) is None:
+        args.extrinsics_source = preset.single_extrinsics
+    return preset
 
 
 def resolve_input_hw(args, preset: ModelPreset) -> tuple[int, int]:
@@ -1405,16 +1672,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     torch.set_float32_matmul_precision("high")
 
+    # Resolve the dataset preset and any unset (None) dataset-derived CLI fields
+    # first; explicit flags always win.  ``--extrinsics-source`` defaults to the
+    # preset's single-frame source (cam2ego for every current preset).
+    dataset = resolve_dataset_defaults(args)
     data_root = resolve_local(args.data_root)
-    # The parser's scene-list default is the canonical trainval2 list.  Keep it
-    # relative to --data-root so overriding only --data-root still picks up that
-    # root's <data-root>/nuScenes_Val2.txt; an explicit --scene-list wins.
-    if args.scene_list == str(DEFAULT_SCENE_LIST_PATH):
-        scene_list = data_root / DEFAULT_SCENE_LIST_NAME
-    else:
-        scene_list = resolve_local(args.scene_list)
+    scene_list = resolve_local(args.scene_list)
     output_dir = resolve_local(args.output_dir)
     cameras = parse_cameras(args.cameras)
+    print(
+        f"[info] Dataset preset '{dataset.name}' (kind={dataset.mask_kind}): "
+        f"data_root={data_root}, cameras={tuple(cameras)}, "
+        f"render_camera={args.render_camera}, "
+        f"extrinsics_source={args.extrinsics_source}.",
+        file=sys.stderr,
+    )
 
     if args.render_camera not in cameras:
         raise SystemExit(
@@ -1476,13 +1748,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"[info] Using effective patch size {patch_size} from the composed config.",
             file=sys.stderr,
         )
-    dst_hw = round_hw_to_multiple(requested_hw, patch_size)
+    dst_hw = resolve_dataset_input_hw(args, preset, dataset, patch_size)
     if dst_hw != requested_hw:
-        print(
-            f"[info] Input size {requested_hw[0]}x{requested_hw[1]} rounded to "
-            f"{dst_hw[0]}x{dst_hw[1]} (multiple of effective patch {patch_size}).",
-            file=sys.stderr,
-        )
+        if (
+            dataset.input_height_policy == "aspect"
+            and args.height is None
+            and args.input_size is None
+        ):
+            print(
+                f"[info] Dataset '{dataset.name}' derives the input height from "
+                f"its native aspect at width {dst_hw[1]}: "
+                f"{requested_hw[0]}x{requested_hw[1]} -> {dst_hw[0]}x{dst_hw[1]} "
+                f"(nearest multiple of effective patch {patch_size}).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[info] Input size {requested_hw[0]}x{requested_hw[1]} rounded to "
+                f"{dst_hw[0]}x{dst_hw[1]} (multiple of effective patch {patch_size}).",
+                file=sys.stderr,
+            )
 
     checkpoint_path = (
         resolve_local(args.checkpoint)
@@ -1537,17 +1822,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"Source image resolution: {src_hw[0]}x{src_hw[1]}")
 
     # Ego-car masking is enabled by default (same policy as multi-frame).  The
-    # masks are static and the resize/crop plan is constant, so every mask and
-    # the single-frame per-view keep mask are loaded/built exactly once here,
-    # after src_hw/dst_hw are known and before any frame is touched.  For
-    # cameras 5,4,3 with render camera 5 the default masks cams 4 and 3 and
-    # fully preserves the render cam 5.
+    # masks are dataset-level for nuScenes/Lyft (loaded once) but per scene for
+    # DDAD, so a small cache keyed by scene (``None`` for dataset-level kinds)
+    # keeps both cases correct.  For cameras 5,4,3 with render camera 5 the
+    # default masks cams 4 and 3 and fully preserves the render cam 5.
     render_index = list(cameras).index(args.render_camera)
     mask_policy = resolve_car_mask_policy(
         args.disable_car_mask, args.mask_render_view
     )
-    gaussian_filter = None
+    mask_root = None
+    plan = None
     keep_mask = None
+    mask_cache: dict = {}
+
+    def prepare_masks(scene: str):
+        """Return the cached ``(keep_mask, gaussian_filter)`` for ``scene``."""
+        key = scene if dataset.mask_kind == "ddad" else None
+        if key not in mask_cache:
+            camera_keep_masks = load_camera_keep_masks(
+                mask_root,
+                cameras,
+                plan,
+                kind=dataset.mask_kind,
+                scene=scene,
+                ext=dataset.mask_ext,
+            )
+            # Single frame: one view per camera, render view at cameras.index(...).
+            keep = build_car_keep_mask(
+                camera_keep_masks,
+                cameras,
+                1,
+                dst_hw,
+                render_index,
+                mask_render_view=args.mask_render_view,
+            )
+            mask_cache[key] = (keep, make_gaussian_filter(keep))
+        return mask_cache[key]
+
     if mask_policy is None:
         print(
             "[info] Ego-car masking DISABLED (--disable-car-mask, highest "
@@ -1557,17 +1868,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         mask_root = resolve_local(args.car_mask_root)
         plan = plan_resize_and_crop(src_hw, dst_hw)
-        camera_keep_masks = load_camera_keep_masks(mask_root, cameras, plan)
-        # Single frame: one view per camera, render view at cameras.index(...).
-        keep_mask = build_car_keep_mask(
-            camera_keep_masks,
-            cameras,
-            1,
-            dst_hw,
-            render_index,
-            mask_render_view=args.mask_render_view,
-        )
-        gaussian_filter = make_gaussian_filter(keep_mask)
+        keep_mask, _ = prepare_masks(jobs[0][0])
         retained = int(keep_mask.sum())
         total = int(keep_mask.size)
         if mask_policy == CAR_MASK_POLICY_ALL:
@@ -1581,11 +1882,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"{args.render_camera}) at render_index={render_index}, which is "
                 "fully preserved"
             )
+        scope = "per scene" if dataset.mask_kind == "ddad" else "dataset-level"
         print(
-            f"[info] Ego-car masking enabled from {mask_root} "
-            f"(policy={mask_policy}): {policy_detail}; kept {retained}/{total} "
-            f"resized mask pixels ({total - retained} removed) over "
-            f"V={keep_mask.shape[0]} views.",
+            f"[info] Ego-car masking enabled from {mask_root} ({scope}) "
+            f"(policy={mask_policy}): {policy_detail}; first scene kept "
+            f"{retained}/{total} resized mask pixels ({total - retained} removed) "
+            f"over V={keep_mask.shape[0]} views.",
             file=sys.stderr,
         )
 
@@ -1594,6 +1896,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             jobs, total=len(jobs), unit="frame", desc="Validating frames (dry-run)"
         ) as progress:
             for index, (scene, frame) in enumerate(progress):
+                if mask_policy is not None:
+                    # Validate this scene's masks (DDAD masks are per scene).
+                    prepare_masks(scene)
                 inputs = load_frame_inputs(
                     data_root / scene,
                     scene,
@@ -1659,6 +1964,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for scene, frame in progress:
             progress.set_postfix(scene=scene, frame=frame)
             scene_dir = data_root / scene
+            scene_filter = None
+            if mask_policy is not None:
+                _, scene_filter = prepare_masks(scene)
             inputs = load_frame_inputs(
                 scene_dir,
                 scene,
@@ -1679,7 +1987,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.far,
                 device,
                 args.amp,
-                gaussian_filter=gaussian_filter,
+                gaussian_filter=scene_filter,
             )
             progress.set_postfix(
                 scene=scene, frame=frame, out=f"{out_h}x{out_w}"
