@@ -753,7 +753,9 @@ def validate_checkpoint_preset(checkpoint_path: Path, preset_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def compose_config_dict(args, preset: ModelPreset, dinov2_source=None):
+def compose_config_dict(
+    args, preset: ModelPreset, dinov2_source=None, local_mv_match=None
+):
     """Compose the repository Hydra config for the dl3dv experiment.
 
     ``dinov2_source`` (a validated local directory) is composed into the encoder
@@ -761,6 +763,12 @@ def compose_config_dict(args, preset: ModelPreset, dinov2_source=None):
     trained DINOv2 weights under ``encoder.depth_predictor.pretrained.*``, so the
     architecture is built with random weights and then strict-loaded, never
     downloading DINOv2 from the network.
+
+    ``local_mv_match`` is an optional override of
+    ``model.encoder.local_mv_match`` (the number of *additional* nearest views
+    the multi-view transformer matches against).  ``None`` keeps the training
+    default, so single-frame callers are unaffected; the multi-frame script
+    passes ``V - 1`` so that every flattened view participates.
     """
     from hydra import compose, initialize_config_dir
 
@@ -783,6 +791,8 @@ def compose_config_dict(args, preset: ModelPreset, dinov2_source=None):
     if dinov2_source is not None:
         overrides.append(f"model.encoder.dinov2_source={dinov2_source}")
         overrides.append("model.encoder.dinov2_pretrained=false")
+    if local_mv_match is not None:
+        overrides.append(f"model.encoder.local_mv_match={int(local_mv_match)}")
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg_dict = compose(config_name="main", overrides=overrides)
     return cfg_dict

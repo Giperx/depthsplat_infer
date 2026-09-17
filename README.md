@@ -620,6 +620,112 @@ or clone `facebookresearch/dinov2` and point `--dinov2-source` at the clone.
   frustum is outside the training distribution, so results are for research
   exploration rather than a trained-model benchmark.
 
+## nuScenes Multi-Frame Wide-View Inference
+
+`scripts/inference_nuscenes_wide_multiframes.py` is the temporal-context
+counterpart of the single-frame path: it feeds `--num-frames` consecutive frames
+(default 3) x cameras `5,4,3` to the DepthSplat encoder at once and renders a
+widened image from the **newest** frame's camera `5`. It reuses the single-frame
+script's helpers (resize/crop, intrinsics, wide-K, model construction) but is a
+standalone entry point, analogous to
+`dggt_infer/inference_nuscenes_multiframes.py`.
+
+### Usage
+
+```bash
+# Defaults: 448x768 model, 3 consecutive frames, every scene in the scene list,
+# every complete window, no input images saved.
+python scripts/inference_nuscenes_wide_multiframes.py \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_wide_multiframes
+
+# Explicit defaults (shown for clarity):
+python scripts/inference_nuscenes_wide_multiframes.py \
+  --model 448x768 --input-size 448x768 --num-frames 3 --cameras 5,4,3 \
+  --render-camera 5 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_wide_multiframes
+
+# A single output frame (the window whose newest frame is 002):
+python scripts/inference_nuscenes_wide_multiframes.py \
+  --scene 037 --frame 002 --num-frames 3 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_wide_multiframes
+```
+
+### Causal windows
+
+For valid frames `[000,001,002,003]` and `--num-frames 3`:
+
+| Window | Output (newest) frame |
+| --- | --- |
+| `[000,001,002]` | `002` |
+| `[001,002,003]` | `003` |
+
+- A window is always ordered oldest -> newest and ends on the frame that is
+  rendered, so output frame ids start at `num_frames - 1` (`002` for three
+  frames). **Incomplete** leading windows are skipped: a scene with fewer than
+  `--num-frames` valid frames produces no output.
+- `--frame` selects the window whose **newest/output** frame is the given id
+  (e.g. `--frame 002`); a frame with fewer than `num_frames - 1` valid
+  predecessors has no complete window and is skipped.
+- `--max-frames N` limits the **source** frame enumeration per scene *before*
+  windowing (so `--num-frames 3 --max-frames 3` yields only the `[000,001,002]`
+  window). The default `-1` enumerates every valid frame.
+- `--scene`, `--frame` and `--max-frames` otherwise behave like the single-frame
+  script; `--cameras` (default `5,4,3`) and `--render-camera` (default `5`) set
+  the context and rendered views.
+
+### Per-frame extrinsics
+
+Multi-frame inference **always** uses the already-computed per-frame global
+camera-to-world matrices `extrinsics/{frame}_{cam}.txt` directly; it never reads
+the static `cam2ego_extrinsics/{cam}.txt` and never recomputes `ego_pose`. Every
+view in a window keeps its own global C2W matrix, so all frames live in one
+consistent world frame. A missing per-frame file is a hard error. (The
+single-frame script's `--extrinsics-source` A/B switch does not exist here.)
+
+Views are flattened **frame-major** into a
+`[1, num_frames*len(cameras), 3, H, W]` tensor, each with its normalized K and
+global C2W:
+
+```
+[oldest cam5, oldest cam4, oldest cam3, ..., newest cam5, newest cam4, newest cam3]
+```
+
+All frames of a window share one source shape and one resize/crop plan; a shape
+mismatch fails loudly.
+
+### local-mv-match
+
+DepthSplat's multi-view transformer matches each reference view against only
+`local_mv_match + 1` nearest views (by camera-centre distance) when `V > 3`. With
+the trained default `local_mv_match=2`, a nine-view window would mostly select
+the *temporal same-camera* views (their centres are close) and drop the lateral
+cameras. This script therefore composes
+`model.encoder.local_mv_match = num_frames*len(cameras) - 1` by default (`8` for
+`V = 9`), so every flattened view participates. Pass `--local-mv-match N` (e.g.
+`2` for the trained config default) to override it; negative values are
+rejected. Because the encoder keeps only `local_mv_match + 1` views when
+`V > 3`, an explicit `--local-mv-match 0` would keep each view only against
+itself and leave an empty cross-view cost volume that can produce NaNs, so `0`
+is rejected for `V > 3`. It remains valid for `V <= 3` (including single-frame
+windows), where the encoder matches all views and ignores the setting.
+
+### Output
+
+- Only the newest frame's render camera is rendered and written to
+  `<output>/<scene>/rgb/{newest_frame}_{render_cam}_wide.jpg` (JPEG quality 95),
+  e.g. `002_5_wide.jpg` — the same file naming as the single-frame script. Use a
+  **different `--output-dir`** from the single-frame run to avoid overwriting its
+  results; the default is `outputs/nuscenes_wide_multiframes`.
+- Input images are not saved unless `--save-inputs` is passed, and no mask/alpha
+  image is invented.
+
+Model presets, `--input-size` semantics, offline DINOv2 handling, resize/crop and
+patch sizes, strict encoder loading and `--dry-run` are shared with the
+single-frame script and documented above.
+
 ## Citation
 
 ```
