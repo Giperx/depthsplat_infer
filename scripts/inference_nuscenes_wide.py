@@ -203,7 +203,10 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
         gaussian_scale_max=3.0,
     ),
 }
-DEFAULT_PRESET = "448x768"
+# Default to the smaller local model so the default run needs less memory; the
+# larger 448x768 preset stays available via ``--model 448x768`` (optionally with
+# ``--input-size 448x768``).
+DEFAULT_PRESET = "256x448"
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +585,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PRESET,
         help=(
             "Model architecture preset; selects vitb/num_scales/upsample_factor/"
-            "gaussian_scale_max and the matching default checkpoint. "
+            "gaussian_scale_max and the matching default checkpoint. Defaults to "
+            "the smaller local preset; use --input-size to resize independently. "
             "--resolution is a legacy alias for --model."
         ),
     )

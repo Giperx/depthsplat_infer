@@ -443,7 +443,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=wide.DEFAULT_PRESET,
         help=(
             "Model architecture preset; selects vitb/num_scales/upsample_factor/"
-            "gaussian_scale_max and the matching default checkpoint. "
+            "gaussian_scale_max and the matching default checkpoint. Defaults to "
+            "the smaller local preset; use --input-size to resize independently. "
             "--resolution is a legacy alias for --model."
         ),
     )

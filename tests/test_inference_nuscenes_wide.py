@@ -401,12 +401,24 @@ class ParserDefaultsTest(unittest.TestCase):
         self.args = wide.build_arg_parser().parse_args([])
 
     def test_model_preset_default(self):
-        self.assertEqual(self.args.model, "448x768")
-        self.assertEqual(wide.DEFAULT_PRESET, "448x768")
-        # Input size defaults to the model preset (no explicit override).
+        self.assertEqual(self.args.model, "256x448")
+        self.assertEqual(wide.DEFAULT_PRESET, "256x448")
+        # Input size defaults to the model preset (no explicit override)...
         self.assertIsNone(self.args.input_size)
         self.assertIsNone(self.args.height)
         self.assertIsNone(self.args.width)
+        # ...so the effective default input is the 256x448 preset size.
+        preset = wide.MODEL_PRESETS[wide.DEFAULT_PRESET]
+        self.assertEqual(wide.resolve_input_hw(self.args, preset), (256, 448))
+
+    def test_explicit_large_preset_still_supported(self):
+        args = wide.build_arg_parser().parse_args(
+            ["--model", "448x768", "--input-size", "448x768"]
+        )
+        self.assertEqual(args.model, "448x768")
+        self.assertEqual(args.input_size, (448, 768))
+        preset = wide.MODEL_PRESETS["448x768"]
+        self.assertEqual(wide.resolve_input_hw(args, preset), (448, 768))
 
     def test_resolution_is_legacy_alias_for_model(self):
         parser = wide.build_arg_parser()

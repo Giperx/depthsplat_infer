@@ -433,7 +433,7 @@ come from the static camera-to-ego rig (see
 ### Usage
 
 ```bash
-# Defaults: 448x768 model, every scene in the scene list, every valid frame,
+# Defaults: 256x448 model, every scene in the scene list, every valid frame,
 # no input images saved.
 python scripts/inference_nuscenes_wide.py \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
@@ -442,22 +442,22 @@ python scripts/inference_nuscenes_wide.py \
 # Select the model preset and the input resize size explicitly (these are the
 # same as the defaults, shown for clarity):
 python scripts/inference_nuscenes_wide.py \
-  --model 448x768 \
-  --input-size 448x768 \
-  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
-  --output-dir outputs/nuscenes_wide
-
-# The other local checkpoint, rendered at its native 256x448 input:
-python scripts/inference_nuscenes_wide.py \
   --model 256x448 \
   --input-size 256x448 \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
-  --output-dir outputs/nuscenes_wide_256x448
+  --output-dir outputs/nuscenes_wide
 
-# Render a single scene/frame instead:
+# The larger local checkpoint, rendered at its native 448x768 input:
 python scripts/inference_nuscenes_wide.py \
   --model 448x768 \
   --input-size 448x768 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_wide_448x768
+
+# Render a single scene/frame instead:
+python scripts/inference_nuscenes_wide.py \
+  --model 256x448 \
+  --input-size 256x448 \
   --scene 037 \
   --frame 0 \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
@@ -465,8 +465,10 @@ python scripts/inference_nuscenes_wide.py \
   --output-dir outputs/nuscenes_wide
 ```
 
-- The model defaults to the `448x768` preset; context cameras default to
-  `5,4,3`, the render camera to `5`, and the output width factor to `2`.
+- The model defaults to the `256x448` preset (whose default input is therefore
+  `256x448`; the `448x768` model is available via `--model 448x768`); context
+  cameras default to `5,4,3`, the render camera to `5`, and the output width
+  factor to `2`.
 - `--model` selects the **architecture preset**: it fixes `vitb`,
   `num_scales`, `upsample_factor`, `lowest_feature_resolution` and
   `gaussian_scale_max`, and chooses the matching default checkpoint. It is
@@ -533,8 +535,8 @@ its architecture; `--input-size` chooses the input resize independently:
 
 | `--model` (alias `--resolution`) | Default checkpoint | Default input | Output (factor 2) | `gaussian_scale_max` |
 | --- | --- | --- | --- | --- |
-| `448x768` (default) | `pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth` | 448x768 | 448x1536 | 0.1 |
-| `256x448` | `pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth` | 256x448 | 256x896 | 3.0 |
+| `256x448` (default) | `pretrained/depthsplat-gs-base-dl3dv-256x448-randview2-6-02c7b19d.pth` | 256x448 | 256x896 | 3.0 |
+| `448x768` | `pretrained/depthsplat-gs-base-re10kdl3dv-448x768-randview2-6-f8ddd845.pth` | 448x768 | 448x1536 | 0.1 |
 
 Both are 117M `vitb` models, so the script sets
 `monodepth_vit_type=vitb`, `num_scales=2`, `upsample_factor=4` and
@@ -633,7 +635,7 @@ standalone entry point, analogous to
 ### Usage
 
 ```bash
-# Defaults: 448x768 model, 3 consecutive frames, every scene in the scene list,
+# Defaults: 256x448 model, 3 consecutive frames, every scene in the scene list,
 # every complete window, no input images saved.
 python scripts/inference_nuscenes_wide_multiframes.py \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
@@ -641,7 +643,7 @@ python scripts/inference_nuscenes_wide_multiframes.py \
 
 # Explicit defaults (shown for clarity):
 python scripts/inference_nuscenes_wide_multiframes.py \
-  --model 448x768 --input-size 448x768 --num-frames 3 --cameras 5,4,3 \
+  --model 256x448 --input-size 256x448 --num-frames 3 --cameras 5,4,3 \
   --render-camera 5 \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --output-dir outputs/nuscenes_wide_multiframes

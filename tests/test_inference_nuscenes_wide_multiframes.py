@@ -238,10 +238,23 @@ class ParserDefaultsTest(unittest.TestCase):
         self.args = mf.build_arg_parser().parse_args([])
 
     def test_model_and_input_defaults(self):
-        self.assertEqual(self.args.model, "448x768")
+        self.assertEqual(self.args.model, "256x448")
+        self.assertEqual(mf.wide.DEFAULT_PRESET, "256x448")
         self.assertIsNone(self.args.input_size)
         self.assertIsNone(self.args.height)
         self.assertIsNone(self.args.width)
+        # The effective default input follows the model preset.
+        preset = mf.wide.MODEL_PRESETS[mf.wide.DEFAULT_PRESET]
+        self.assertEqual(mf.wide.resolve_input_hw(self.args, preset), (256, 448))
+
+    def test_explicit_large_preset_still_supported(self):
+        args = mf.build_arg_parser().parse_args(
+            ["--model", "448x768", "--input-size", "448x768"]
+        )
+        self.assertEqual(args.model, "448x768")
+        self.assertEqual(args.input_size, (448, 768))
+        preset = mf.wide.MODEL_PRESETS["448x768"]
+        self.assertEqual(mf.wide.resolve_input_hw(args, preset), (448, 768))
 
     def test_num_frames_default(self):
         self.assertEqual(self.args.num_frames, 3)
