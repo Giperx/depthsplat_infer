@@ -463,6 +463,17 @@ python scripts/inference_nuscenes_wide.py \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --width-factor 2 \
   --output-dir outputs/nuscenes_wide
+
+# Ego-car masking is on by default (cameras 4 and 3 masked, render camera 5
+# preserved); mask the render view too for a diagnostic, or disable entirely:
+python scripts/inference_nuscenes_wide.py \
+  --mask-render-view \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_wide_all_masks_check
+python scripts/inference_nuscenes_wide.py \
+  --disable-car-mask \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_wide
 ```
 
 - The model defaults to the `256x448` preset (whose default input is therefore
@@ -527,6 +538,50 @@ processed scene folders ship two candidates:
 If the selected file is missing the run fails with an error naming the missing
 path, the active source, and the flag to switch to the other source; the two
 sources are never mixed implicitly.
+
+### Ego-car masking
+
+Single-frame inference masks the ego-car pixels by default (enabled, same
+policy and implementation as the multi-frame path). Each selected camera has a
+static mask under `--car-mask-root` (default
+`datasets/nuscenes/processed_10Hz/nuscenes_mask`), mapped by nuScenes camera id:
+
+| Camera id | Camera | Mask file |
+| --- | --- | --- |
+| 0 | `CAM_FRONT` | `CAM_FRONT_mask.png` |
+| 1 | `CAM_FRONT_LEFT` | `CAM_FRONT_LEFT_mask.png` |
+| 2 | `CAM_FRONT_RIGHT` | `CAM_FRONT_RIGHT_mask.png` |
+| 3 | `CAM_BACK_LEFT` | `CAM_BACK_LEFT_mask.png` |
+| 4 | `CAM_BACK_RIGHT` | `CAM_BACK_RIGHT_mask.png` |
+| 5 | `CAM_BACK` | `CAM_BACK_mask.png` |
+
+- **Polarity**: black (`< 128`) pixels are removed; white (`>= 128`) pixels are
+  kept.
+- **Transform**: each mask is loaded as PIL `L` and transformed with *exactly*
+  the images' resize/crop plan — a NEAREST resize to the scaled size, then the
+  same centre crop. It is **not** plain-resized straight to the destination, so
+  mask pixels stay aligned with the resized/cropped images. The mask's source
+  resolution must equal the source images' resolution.
+- **Which views (default, `all_except_render_view`)**: each camera's mask is
+  applied to its own context view, **except the render camera which is fully
+  preserved**. For the default cameras `5,4,3` with render camera `5`, cameras
+  **4 and 3** are masked and camera **5** is kept whole.
+- **Diagnostic (`--mask-render-view`, `all_views`)**: additionally applies each
+  camera's mask to the render view (camera 5), so the preset ego-car region is
+  removed there too.
+- **Disable (`--disable-car-mask`)**: highest precedence; keeps every Gaussian
+  from every view and overrides both policies above.
+- **Precedence**: `--disable-car-mask` > `--mask-render-view` > default.
+- **Failure mode**: a missing required mask for any selected camera is a hard
+  error (there is no silent all-ones fallback).
+- Pruning drops the affected Gaussians from `means`, `covariances`, `harmonics`
+  and `opacities` identically (rather than only zeroing opacity) after the
+  encoder and before the decoder. This is the same shared implementation used by
+  the multi-frame path.
+
+The current masks only have black pixels in `CAM_BACK_mask.png` (camera 5);
+cameras 3 and 4 are white placeholders, so the default single-frame run reports
+them as "applied but 0 removed" today.
 
 ### Checkpoints and input resolutions
 
@@ -754,6 +809,11 @@ has a static mask under `--car-mask-root` (default
   and `opacities` identically (rather than only zeroing opacity) after the
   encoder and before the decoder.
 
+The multi-frame and single-frame paths share one mask implementation and the
+same policy (`--car-mask-root` / `--mask-render-view` / `--disable-car-mask`);
+see the single-frame "Ego-car masking" subsection for the mapping/polarity/
+transform details.
+
 This overrides the DGGT nuScenes behaviour (which only masked `CAM_BACK` on
 historical frames): here every camera's mask is applied to its own views under
 the policy above, except the preserved current render view by default.
@@ -787,6 +847,96 @@ windows), where the encoder matches all views and ignores the setting.
 Model presets, `--input-size` semantics, offline DINOv2 handling, resize/crop and
 patch sizes, strict encoder loading and `--dry-run` are shared with the
 single-frame script and documented above.
+
+## Speed benchmark
+
+`scripts/benchmark_nuscenes_wide.py` times the real inference pipeline of either
+path with `torch.cuda.Event` and saves no images. It builds the model once, loads
+one sample once (outside the timing loop), runs `--warmup` iterations (excluded),
+then times `--measure` iterations and reports mean / median / min / max / stdev
+latency in milliseconds and throughput as `1000 / mean` FPS.
+
+### Commands
+
+The four combinations (default model `256x448`; the `448x768` preset renders at
+its native input size):
+
+```bash
+# single frame, 256x448
+python scripts/benchmark_nuscenes_wide.py \
+  --mode single --model 256x448 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
+
+# single frame, 448x768
+python scripts/benchmark_nuscenes_wide.py \
+  --mode single --model 448x768 --input-size 448x768 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
+
+# multi frame (3 consecutive frames), 256x448
+python scripts/benchmark_nuscenes_wide.py \
+  --mode multi --model 256x448 --num-frames 3 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
+
+# multi frame (3 consecutive frames), 448x768
+python scripts/benchmark_nuscenes_wide.py \
+  --mode multi --model 448x768 --input-size 448x768 --num-frames 3 \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
+```
+
+Override the sampling / timing and write JSON stats for scripted comparisons:
+
+```bash
+# first complete window of a specific scene, 20 / 100 iterations, JSON output
+python scripts/benchmark_nuscenes_wide.py \
+  --mode multi --model 256x448 --scene 037 --frame 002 \
+  --warmup 20 --measure 100 \
+  --json outputs/bench_multi_256x448.json \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
+```
+
+### What is measured
+
+Each timed iteration calls exactly the inference scripts' pipeline:
+
+```
+images → wide._render_wide_impl(...) → encoder → (ego-car Gaussian filter) → decoder → RGB
+```
+
+- `--mode single` loads a frame with `wide.load_frame_inputs` (static `cam2ego`
+  extrinsics, as in `inference_nuscenes_wide.py`).
+- `--mode multi` loads a causal window with `mf.load_window_inputs` (per-frame
+  global extrinsics, as in `inference_nuscenes_wide_multiframes.py`).
+- The model is built once with `wide.build_model`; the ego-car `gaussian_filter`
+  is built with the same policy resolution as the inference scripts (masking is
+  **on** by default, `--disable-car-mask` / `--mask-render-view` behave
+  identically).
+
+### Metrics
+
+| Metric | Definition |
+| --- | --- |
+| `mean_ms` / `median_ms` / `min_ms` / `max_ms` | per-iteration CUDA-event wall time |
+| `stdev_ms` | sample standard deviation (`0` for a single sample) |
+| `fps` | `1000 / mean_ms` |
+
+### Notes
+
+- **Warmup**: the first `--warmup` iterations (default `10`) are run before
+  timing and excluded from the statistics, so lazy CUDA kernel loading / cuDNN
+  autotuning does not inflate the result.
+- **Timing excludes data loading and model loading**: the sample is loaded once
+  and the model built once, both *before* the timing loop; their one-time cost
+  is reported separately (`Data load` / `Model build` in the output).
+- **No images are saved** and there is no `--output-dir`.
+- **CUDA is required** for the Gaussian-splatting decoder; when
+  `torch.cuda.is_available()` is false the script exits with a clear error.
+- **Offline DINOv2**: `--dinov2-source` must resolve to a local source (no
+  network fallback), exactly like the inference scripts.
+- **JSON**: pass `--json PATH` to also write the metadata and stats as JSON.
+- Sample selection defaults to the first scene in the scene list and the first
+  valid frame (single) / first complete window (multi); `--scene` / `--frame`
+  narrow it. `--local-mv-match` is multi-only and defaults to `V - 1`; passing
+  it in `--mode single` is rejected.
 
 ## Citation
 

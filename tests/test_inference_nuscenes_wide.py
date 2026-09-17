@@ -11,6 +11,7 @@ they do not require CUDA or the Gaussian rasterizer.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import sys
 import tempfile
@@ -589,6 +590,232 @@ class ExtrinsicsSourceTest(unittest.TestCase):
     def test_resolve_path_rejects_unknown(self):
         with self.assertRaises(ValueError):
             wide.resolve_extrinsics_path(Path("/scene"), "006", 3, "global")
+
+
+class CarMaskParserDefaultsTest(unittest.TestCase):
+    """Single-frame masking is on by default with the shared policy flags."""
+
+    def setUp(self):
+        self.args = wide.build_arg_parser().parse_args([])
+
+    def test_defaults(self):
+        self.assertEqual(
+            self.args.car_mask_root,
+            "datasets/nuscenes/processed_10Hz/nuscenes_mask",
+        )
+        self.assertEqual(
+            self.args.car_mask_root, str(wide.DEFAULT_CAR_MASK_ROOT)
+        )
+        self.assertFalse(self.args.mask_render_view)
+        self.assertFalse(self.args.disable_car_mask)
+
+    def test_mask_render_view_flag(self):
+        args = wide.build_arg_parser().parse_args(["--mask-render-view"])
+        self.assertTrue(args.mask_render_view)
+        self.assertFalse(args.disable_car_mask)
+
+    def test_disable_flag(self):
+        args = wide.build_arg_parser().parse_args(["--disable-car-mask"])
+        self.assertTrue(args.disable_car_mask)
+        self.assertFalse(args.mask_render_view)
+
+    def test_car_mask_root_override(self):
+        args = wide.build_arg_parser().parse_args(
+            ["--car-mask-root", "/some/other/masks"]
+        )
+        self.assertEqual(args.car_mask_root, "/some/other/masks")
+
+    def test_extrinsics_source_default_unchanged(self):
+        # The mask work must not change the cam2ego default.
+        self.assertEqual(self.args.extrinsics_source, "cam2ego")
+
+
+class SharedMaskConstantsTest(unittest.TestCase):
+    """The single-frame script is the single source of the mask constants."""
+
+    def test_camera_mapping(self):
+        self.assertEqual(
+            wide.CAMERA_MASK_FILES,
+            {
+                0: "CAM_FRONT_mask.png",
+                1: "CAM_FRONT_LEFT_mask.png",
+                2: "CAM_FRONT_RIGHT_mask.png",
+                3: "CAM_BACK_LEFT_mask.png",
+                4: "CAM_BACK_RIGHT_mask.png",
+                5: "CAM_BACK_mask.png",
+            },
+        )
+
+    def test_policy_names(self):
+        self.assertEqual(
+            wide.CAR_MASK_POLICY_ALL_EXCEPT_RENDER, "all_except_render_view"
+        )
+        self.assertEqual(wide.CAR_MASK_POLICY_ALL, "all_views")
+
+    def test_disable_precedence(self):
+        self.assertIsNone(wide.resolve_car_mask_policy(True, False))
+        self.assertIsNone(wide.resolve_car_mask_policy(True, True))
+        self.assertEqual(
+            wide.resolve_car_mask_policy(False, False),
+            wide.CAR_MASK_POLICY_ALL_EXCEPT_RENDER,
+        )
+        self.assertEqual(
+            wide.resolve_car_mask_policy(False, True), wide.CAR_MASK_POLICY_ALL
+        )
+
+
+class SingleFrameCarMaskPolicyTest(unittest.TestCase):
+    """Default masks cams 4/3; render cam 5 is preserved."""
+
+    CAMERAS = (5, 4, 3)
+    DST_HW = (2, 2)
+    # Single frame -> render index is cameras.index(render_camera) = 0 for cam5.
+    RENDER_INDEX = 0
+
+    def _masks(self):
+        return {
+            5: np.array([[True, True], [True, False]], dtype=bool),
+            4: np.array([[False, True], [True, True]], dtype=bool),
+            3: np.array([[True, False], [False, True]], dtype=bool),
+        }
+
+    def test_default_masks_cam4_and_cam3_keeps_cam5(self):
+        masks = self._masks()
+        keep = wide.build_car_keep_mask(
+            masks, self.CAMERAS, 1, self.DST_HW, self.RENDER_INDEX
+        )
+        self.assertEqual(keep.shape, (3, 2, 2))
+        self.assertTrue(keep[0].all())  # render cam 5 preserved
+        np.testing.assert_array_equal(keep[1], masks[4])
+        np.testing.assert_array_equal(keep[2], masks[3])
+        self.assertEqual([v for v in range(3) if keep[v].all()], [0])
+
+    def test_mask_render_view_masks_all_cameras(self):
+        masks = self._masks()
+        keep = wide.build_car_keep_mask(
+            masks, self.CAMERAS, 1, self.DST_HW, self.RENDER_INDEX,
+            mask_render_view=True,
+        )
+        for view, cam in enumerate(self.CAMERAS):
+            np.testing.assert_array_equal(keep[view], masks[cam])
+        self.assertFalse(keep[0].all())
+
+    def test_default_removes_only_side_camera_pixels(self):
+        masks = self._masks()
+        keep = wide.build_car_keep_mask(
+            masks, self.CAMERAS, 1, self.DST_HW, self.RENDER_INDEX
+        )
+        removed = int((~keep).sum())
+        expected = int((~masks[4]).sum()) + int((~masks[3]).sum())
+        self.assertEqual(removed, expected)
+
+    def test_render_camera_index_matches_list_index(self):
+        # For a different render camera the preserved view follows the list.
+        masks = self._masks()
+        keep = wide.build_car_keep_mask(
+            masks, self.CAMERAS, 1, self.DST_HW, list(self.CAMERAS).index(4)
+        )
+        np.testing.assert_array_equal(keep[0], masks[5])
+        self.assertTrue(keep[1].all())
+        np.testing.assert_array_equal(keep[2], masks[3])
+
+
+class SingleFrameMissingMaskTest(unittest.TestCase):
+    """A missing required mask is a hard error (no all-ones fallback)."""
+
+    def test_missing_camera_mask_raises_with_path(self):
+        with self.assertRaises(FileNotFoundError) as ctx:
+            wide.load_camera_keep_masks(
+                Path("/nonexistent/mask/root"),
+                (5, 4, 3),
+                wide.plan_resize_and_crop((2, 2), (2, 2)),
+            )
+        self.assertIn("CAM_BACK_mask.png", str(ctx.exception))
+
+    def test_partial_root_reports_missing_camera(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Image.new("L", (2, 2), 255).save(root / "CAM_BACK_mask.png")
+            Image.new("L", (2, 2), 255).save(root / "CAM_BACK_RIGHT_mask.png")
+            with self.assertRaises(FileNotFoundError) as ctx:
+                wide.load_camera_keep_masks(
+                    root, (5, 4, 3), wide.plan_resize_and_crop((2, 2), (2, 2))
+                )
+            self.assertIn("CAM_BACK_LEFT_mask.png", str(ctx.exception))
+
+
+class SingleFrameGaussianPruningIntegrationTest(unittest.TestCase):
+    """A V=3 keep mask prunes all four Gaussian fields in a synchronized way."""
+
+    @dataclasses.dataclass
+    class _Gaussians:
+        means: object
+        covariances: object
+        harmonics: object
+        opacities: object
+
+    def setUp(self):
+        if torch is None:  # pragma: no cover - environment dependent
+            self.skipTest("torch is required to build Gaussian test tensors")
+
+    def _gaussians(self, v, h, w):
+        idx = torch.arange(v * h * w, dtype=torch.float32)
+        g = idx.numel()
+        return self._Gaussians(
+            means=idx.view(1, g, 1).repeat(1, 1, 3),
+            covariances=idx.view(1, g, 1, 1).repeat(1, 1, 3, 3),
+            harmonics=idx.view(1, g, 1, 1).repeat(1, 1, 3, 2),
+            opacities=idx.view(1, g),
+        )
+
+    def test_default_v3_prunes_cam4_and_cam3_pixels(self):
+        v, h, w = 3, 2, 2
+        gaussians = self._gaussians(v, h, w)
+        masks = {
+            5: np.array([[True, True], [True, False]], dtype=bool),
+            4: np.array([[False, True], [True, True]], dtype=bool),
+            3: np.array([[True, False], [False, True]], dtype=bool),
+        }
+        keep_mask = wide.build_car_keep_mask(
+            masks, (5, 4, 3), 1, (h, w), 0
+        )
+        keep_flat = wide.expand_keep_mask_to_gaussians(keep_mask, 1)
+        self.assertEqual(keep_flat.shape, (v * h * w,))
+
+        pruned = wide.filter_gaussians_by_camera_mask(
+            gaussians, keep_mask, v, h, w
+        )
+        expected_index = np.nonzero(keep_flat)[0]
+        self.assertEqual(pruned.means.shape[1], expected_index.size)
+        for tensor in (
+            pruned.means[0, :, 0],
+            pruned.covariances[0, :, 0, 0],
+            pruned.harmonics[0, :, 0, 0],
+            pruned.opacities[0],
+        ):
+            np.testing.assert_array_equal(
+                tensor.numpy(), expected_index.astype(np.float32)
+            )
+        self.assertIsInstance(pruned, type(gaussians))
+
+    def test_make_gaussian_filter_closure_uses_v3_mask(self):
+        v, h, w = 3, 2, 2
+        masks = {
+            5: np.ones((h, w), dtype=bool),
+            4: np.zeros((h, w), dtype=bool),
+            3: np.zeros((h, w), dtype=bool),
+        }
+        keep_mask = wide.build_car_keep_mask(masks, (5, 4, 3), 1, (h, w), 0)
+        callback = wide.make_gaussian_filter(keep_mask)
+        gaussians = self._gaussians(v, h, w)
+        pruned = callback(gaussians, v, h, w)
+        # Only cam5 (view 0) survives: h*w Gaussians remain.
+        self.assertEqual(pruned.means.shape[1], h * w)
+        self.assertFalse(keep_mask[1].any())
+        self.assertFalse(keep_mask[2].any())
+        self.assertTrue(keep_mask[0].all())
 
 
 class ExtrinsicsLoaderTest(unittest.TestCase):

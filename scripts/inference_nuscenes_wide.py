@@ -89,6 +89,27 @@ DEFAULT_WIDTH_FACTOR = 2.0
 DEFAULT_EXTRINSICS_SOURCE = "cam2ego"
 EXTRINSICS_SOURCE_CHOICES = ("cam2ego", "per_frame")
 
+# Per-camera nuScenes ego-car masks.  Camera ids 0..5 are, in order, CAM_FRONT,
+# CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK_LEFT, CAM_BACK_RIGHT, CAM_BACK; the
+# default cameras 5,4,3 therefore map to CAM_BACK, CAM_BACK_RIGHT, CAM_BACK_LEFT.
+DEFAULT_CAR_MASK_ROOT = Path("datasets/nuscenes/processed_10Hz/nuscenes_mask")
+CAMERA_MASK_FILES: dict[int, str] = {
+    0: "CAM_FRONT_mask.png",
+    1: "CAM_FRONT_LEFT_mask.png",
+    2: "CAM_FRONT_RIGHT_mask.png",
+    3: "CAM_BACK_LEFT_mask.png",
+    4: "CAM_BACK_RIGHT_mask.png",
+    5: "CAM_BACK_mask.png",
+}
+
+# Polarity threshold: black (< 128) is the ego car to remove, white (>= 128)
+# is kept.
+CAR_MASK_KEEP_THRESHOLD = 128
+
+# Masking policy names (reported in info/dry-run diagnostics).
+CAR_MASK_POLICY_ALL_EXCEPT_RENDER = "all_except_render_view"
+CAR_MASK_POLICY_ALL = "all_views"
+
 # The dl3dv experiment applies a patch shim of ``shim_patch_size`` at a
 # ``downscale_factor`` stride, so images must be a multiple of the *effective*
 # patch size ``shim_patch_size * downscale_factor`` (= 16 * 4 = 64 here).  This
@@ -480,6 +501,261 @@ def save_rgb(tensor_chw, path: Path, quality: int = 95) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ego-car mask helpers (no torch at import time)
+# ---------------------------------------------------------------------------
+
+
+def camera_mask_path(mask_root, cam: int) -> Path:
+    """Path of ``cam``'s ego-car mask under ``mask_root``.
+
+    Raises ``KeyError`` for a camera without a nuScenes mask mapping (only
+    0..5 exist); there is deliberately no fallback mask.
+    """
+    cam = int(cam)
+    if cam not in CAMERA_MASK_FILES:
+        raise KeyError(
+            f"No ego-car mask is defined for camera {cam}; known nuScenes "
+            f"cameras are {sorted(CAMERA_MASK_FILES)}."
+        )
+    return Path(mask_root) / CAMERA_MASK_FILES[cam]
+
+
+def load_resized_keep_mask(path, plan: ResizeCropPlan) -> np.ndarray:
+    """Load one ego-car mask through exactly the image resize/crop plan.
+
+    The mask is loaded as PIL ``L`` and transformed *identically* to the RGB
+    context images in :func:`load_resized_rgb`: a NEAREST resize to
+    ``(plan.scaled_w, plan.scaled_h)`` followed by the same centre crop
+    ``(plan.col, plan.row)``.  It is never plain-resized straight to the
+    destination, so mask pixels stay aligned with the resized/cropped image.
+    Returns a ``[plan.out_h, plan.out_w]`` bool array; ``True`` = keep.
+    """
+    from PIL import Image
+
+    path = Path(path)
+    with Image.open(path) as image:
+        mask = image.convert("L")
+        if mask.size != (plan.src_w, plan.src_h):
+            raise ValueError(
+                f"Ego-car mask {path} has size {mask.size[1]}x{mask.size[0]} but "
+                f"the source images/resize plan are {plan.src_h}x{plan.src_w}; "
+                "the mask must match the source image resolution."
+            )
+        if mask.size != (plan.scaled_w, plan.scaled_h):
+            mask = mask.resize((plan.scaled_w, plan.scaled_h), Image.NEAREST)
+        mask = mask.crop(
+            (plan.col, plan.row, plan.col + plan.out_w, plan.row + plan.out_h)
+        )
+        array = np.asarray(mask)
+    return array >= CAR_MASK_KEEP_THRESHOLD
+
+
+def load_camera_keep_masks(
+    mask_root, cameras: Sequence[int], plan: ResizeCropPlan
+) -> dict[int, np.ndarray]:
+    """Load and resize every selected camera's keep mask exactly once.
+
+    Fails loudly (``FileNotFoundError``/``ValueError``) when a required mask is
+    missing or has the wrong source resolution; masking never silently falls
+    back to all-ones.
+    """
+    masks: dict[int, np.ndarray] = {}
+    for cam in cameras:
+        cam = int(cam)
+        path = camera_mask_path(mask_root, cam)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing ego-car mask for camera {cam}: {path}. Masking is "
+                "enabled by default; provide the mask or pass --disable-car-mask "
+                "for a controlled comparison that keeps every Gaussian."
+            )
+        masks[cam] = load_resized_keep_mask(path, plan)
+    return masks
+
+
+def build_car_keep_mask(
+    camera_masks: dict[int, np.ndarray],
+    cameras: Sequence[int],
+    num_frames: int,
+    dst_hw: tuple[int, int],
+    render_index: int,
+    mask_render_view: bool = False,
+) -> np.ndarray:
+    """Build the ``[num_frames * len(cameras), H, W]`` per-view keep mask.
+
+    Flattening is frame-major (same as the encoder input), so view
+    ``v = frame_index * len(cameras) + camera_index`` uses
+    ``cameras[camera_index]``.
+
+    Default policy (``mask_render_view=False``): each view uses its own
+    camera's keep mask for **every view except** the single current/newest
+    render view at ``render_index`` (``t3_cam<render_camera>``), which is kept
+    whole.  For a 3-frame ``[5, 4, 3]`` window that masks historical
+    ``t1/t2`` cams 5/4/3 and the current ``t3`` cams 4/3, leaving only
+    ``t3_cam5`` fully preserved.  With ``num_frames=1`` it masks only the
+    non-render context cameras (e.g. cams 4 and 3) and preserves the render
+    camera.
+
+    Diagnostic policy (``mask_render_view=True``): the camera mask is applied
+    to **all** views, including the render view, so the preset ego-car region is
+    removed there too.
+
+    ``render_index`` must address the newest frame of the window; result is
+    bool with ``True`` = keep.
+    """
+    num_frames = int(num_frames)
+    cameras = [int(cam) for cam in cameras]
+    out_h, out_w = int(dst_hw[0]), int(dst_hw[1])
+    num_views = num_frames * len(cameras)
+    render_index = int(render_index)
+    if not cameras:
+        raise ValueError("At least one camera is required to build a mask.")
+    if not 0 <= render_index < num_views:
+        raise ValueError(
+            f"render_index {render_index} is out of range for {num_views} views."
+        )
+    if render_index // len(cameras) != num_frames - 1:
+        raise ValueError(
+            f"render_index {render_index} does not address the newest frame "
+            f"(frame index {num_frames - 1} of {num_frames}); the render view "
+            "must be the current/newest window view."
+        )
+
+    keep = np.ones((num_views, out_h, out_w), dtype=bool)
+    for view_index in range(num_views):
+        if view_index == render_index and not mask_render_view:
+            continue
+        cam = cameras[view_index % len(cameras)]
+        mask = camera_masks.get(cam)
+        if mask is None:
+            raise KeyError(f"No ego-car mask was loaded for camera {cam}.")
+        if mask.shape != (out_h, out_w):
+            raise ValueError(
+                f"Ego-car mask for camera {cam} has shape {mask.shape} but "
+                f"the model input is {out_h}x{out_w}."
+            )
+        keep[view_index] = mask
+    return keep
+
+
+def resolve_car_mask_policy(
+    disable_car_mask: bool, mask_render_view: bool
+) -> Optional[str]:
+    """Resolve the masking policy name (``--disable-car-mask`` wins).
+
+    Returns ``None`` when masking is disabled, else
+    ``CAR_MASK_POLICY_ALL_EXCEPT_RENDER`` (default) or ``CAR_MASK_POLICY_ALL``
+    when ``--mask-render-view`` is requested.
+    """
+    if disable_car_mask:
+        return None
+    return (
+        CAR_MASK_POLICY_ALL if mask_render_view else CAR_MASK_POLICY_ALL_EXCEPT_RENDER
+    )
+
+
+def expand_keep_mask_to_gaussians(
+    keep_mask: np.ndarray, multiplicity: int
+) -> np.ndarray:
+    """Expand a ``[V, H, W]`` pixel keep mask to the flat Gaussian ordering.
+
+    Encoder Gaussians are ordered ``(v, h*w, surface, spp)`` (see
+    ``encoder_depthsplat``'s ``b (v r srf spp)`` rearrange), so each pixel's
+    keep flag is repeated ``K = num_surfaces * gaussians_per_pixel`` times.
+    Returns a flat bool array of length ``V*H*W*K``.
+    """
+    multiplicity = int(multiplicity)
+    if multiplicity < 1:
+        raise ValueError(f"multiplicity must be >= 1, got {multiplicity}.")
+    mask = np.asarray(keep_mask, dtype=bool)
+    if mask.ndim != 3:
+        raise ValueError(f"keep_mask must be [V, H, W], got shape {mask.shape}.")
+    return np.repeat(mask.reshape(-1), multiplicity)
+
+
+def prune_gaussians_by_keep_flat(gaussians, keep_flat: np.ndarray):
+    """Prune a Gaussians object along dim=1 with a flat bool keep mask.
+
+    All four encoder fields (``means``, ``covariances``, ``harmonics``,
+    ``opacities``) are indexed identically, and the same Gaussians type is
+    reconstructed.  Works for any batch size (the mask is shared across the
+    batch).  Raises if no Gaussian survives.
+    """
+    import torch
+
+    # The keep index must live on the Gaussians' device (they are on CUDA during
+    # real inference) for index_select.
+    keep = torch.as_tensor(
+        np.asarray(keep_flat, dtype=bool), device=gaussians.means.device
+    )
+    if keep.ndim != 1:
+        raise ValueError(f"keep_flat must be 1-D, got shape {keep.shape}.")
+    num_gaussians = int(gaussians.means.shape[1])
+    if keep.shape[0] != num_gaussians:
+        raise ValueError(
+            f"keep mask has {keep.shape[0]} entries but the encoder produced "
+            f"{num_gaussians} Gaussians (dim=1)."
+        )
+    index = keep.nonzero(as_tuple=False).reshape(-1)
+    if index.numel() == 0:
+        raise ValueError(
+            "Ego-car masking would remove every Gaussian; refusing to render an "
+            "empty scene. Check the mask polarity/root."
+        )
+    return type(gaussians)(
+        means=gaussians.means.index_select(1, index),
+        covariances=gaussians.covariances.index_select(1, index),
+        harmonics=gaussians.harmonics.index_select(1, index),
+        opacities=gaussians.opacities.index_select(1, index),
+    )
+
+
+def filter_gaussians_by_camera_mask(
+    gaussians, keep_mask: np.ndarray, num_views: int, height: int, width: int
+):
+    """Apply a ``[V, H, W]`` keep mask to encoder Gaussians.
+
+    Infers the per-pixel multiplicity ``K = G // (V*H*W)`` from the encoder
+    output, validates that ``V*H*W`` divides ``G`` exactly, expands the keep
+    mask over ``K`` and prunes all Gaussian fields together.
+    """
+    num_views, height, width = int(num_views), int(height), int(width)
+    keep_mask = np.asarray(keep_mask, dtype=bool)
+    if keep_mask.shape != (num_views, height, width):
+        raise ValueError(
+            f"keep_mask shape {keep_mask.shape} does not match "
+            f"(V, H, W) = ({num_views}, {height}, {width})."
+        )
+    expected = num_views * height * width
+    num_gaussians = int(gaussians.means.shape[1])
+    if expected <= 0 or num_gaussians % expected != 0:
+        raise ValueError(
+            f"Encoder produced {num_gaussians} Gaussians but V*H*W = "
+            f"{num_views}*{height}*{width} = {expected} does not divide it "
+            "exactly; the encoder resolution and the mask resolution disagree."
+        )
+    multiplicity = num_gaussians // expected
+    keep_flat = expand_keep_mask_to_gaussians(keep_mask, multiplicity)
+    return prune_gaussians_by_keep_flat(gaussians, keep_flat)
+
+
+def make_gaussian_filter(keep_mask: np.ndarray):
+    """Closure for ``_render_wide_impl``'s ``gaussian_filter`` callback.
+
+    The per-view mask is built once and reused for every window; only the
+    multiplicity is inferred per call from the encoder's actual output.
+    """
+    mask = np.asarray(keep_mask, dtype=bool)
+
+    def gaussian_filter(gaussians, num_views, height, width):
+        return filter_gaussians_by_camera_mask(
+            gaussians, mask, num_views, height, width
+        )
+
+    return gaussian_filter
+
+
+# ---------------------------------------------------------------------------
 # argparse
 # ---------------------------------------------------------------------------
 
@@ -573,6 +849,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "reads the per-frame global extrinsics/{frame}_{cam}.txt (ego pose "
             "baked in), which can be inconsistent in this processed data; it is "
             "for explicit A/B comparison only."
+        ),
+    )
+    data.add_argument(
+        "--car-mask-root",
+        default=str(DEFAULT_CAR_MASK_ROOT),
+        help=(
+            "Directory with the per-camera nuScenes ego-car masks "
+            "(CAM_FRONT_mask.png, CAM_FRONT_LEFT_mask.png, CAM_FRONT_RIGHT_mask.png, "
+            "CAM_BACK_LEFT_mask.png, CAM_BACK_RIGHT_mask.png, CAM_BACK_mask.png for "
+            "cameras 0..5). Black (<128) pixels are removed and white (>=128) kept, "
+            "transformed with exactly the same resize/crop plan as the images. "
+            "By default each context camera's mask is applied to its own view, "
+            "except the render camera which is fully preserved: for cameras 5,4,3 "
+            "with render camera 5, cameras 4 and 3 are masked. A missing mask for "
+            "any selected camera is a hard error."
+        ),
+    )
+    data.add_argument(
+        "--mask-render-view",
+        action="store_true",
+        help=(
+            "Diagnostic: also apply each camera's mask to the render view "
+            "(e.g. camera 5), so the preset ego-car region is removed there too. "
+            "Default off: the render view is fully preserved."
+        ),
+    )
+    data.add_argument(
+        "--disable-car-mask",
+        action="store_true",
+        help=(
+            "Disable ego-car masking entirely (keep every Gaussian from every view) "
+            "for a controlled comparison. Highest precedence: it overrides "
+            "--mask-render-view and the default policy."
         ),
     )
 
@@ -1227,6 +1536,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     src_hw = image_size(first_image)
     print(f"Source image resolution: {src_hw[0]}x{src_hw[1]}")
 
+    # Ego-car masking is enabled by default (same policy as multi-frame).  The
+    # masks are static and the resize/crop plan is constant, so every mask and
+    # the single-frame per-view keep mask are loaded/built exactly once here,
+    # after src_hw/dst_hw are known and before any frame is touched.  For
+    # cameras 5,4,3 with render camera 5 the default masks cams 4 and 3 and
+    # fully preserves the render cam 5.
+    render_index = list(cameras).index(args.render_camera)
+    mask_policy = resolve_car_mask_policy(
+        args.disable_car_mask, args.mask_render_view
+    )
+    gaussian_filter = None
+    keep_mask = None
+    if mask_policy is None:
+        print(
+            "[info] Ego-car masking DISABLED (--disable-car-mask, highest "
+            "precedence): every Gaussian from every view is kept.",
+            file=sys.stderr,
+        )
+    else:
+        mask_root = resolve_local(args.car_mask_root)
+        plan = plan_resize_and_crop(src_hw, dst_hw)
+        camera_keep_masks = load_camera_keep_masks(mask_root, cameras, plan)
+        # Single frame: one view per camera, render view at cameras.index(...).
+        keep_mask = build_car_keep_mask(
+            camera_keep_masks,
+            cameras,
+            1,
+            dst_hw,
+            render_index,
+            mask_render_view=args.mask_render_view,
+        )
+        gaussian_filter = make_gaussian_filter(keep_mask)
+        retained = int(keep_mask.sum())
+        total = int(keep_mask.size)
+        if mask_policy == CAR_MASK_POLICY_ALL:
+            policy_detail = (
+                "every view (including the render view; diagnostic "
+                "--mask-render-view)"
+            )
+        else:
+            policy_detail = (
+                "every view except the render view (camera "
+                f"{args.render_camera}) at render_index={render_index}, which is "
+                "fully preserved"
+            )
+        print(
+            f"[info] Ego-car masking enabled from {mask_root} "
+            f"(policy={mask_policy}): {policy_detail}; kept {retained}/{total} "
+            f"resized mask pixels ({total - retained} removed) over "
+            f"V={keep_mask.shape[0]} views.",
+            file=sys.stderr,
+        )
+
     if args.dry_run:
         with tqdm(
             jobs, total=len(jobs), unit="frame", desc="Validating frames (dry-run)"
@@ -1253,6 +1615,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # Keep one concrete diagnostic line instead of one per frame so a
                 # failure can still be traced without flooding the terminal.
                 if index == 0:
+                    if keep_mask is None:
+                        mask_info = " car_mask=disabled car_mask_policy=disabled"
+                    else:
+                        mask_info = (
+                            f" car_mask_policy={mask_policy}"
+                            f" car_mask_removed={int((~keep_mask).sum())}"
+                            f"/{int(keep_mask.size)}"
+                            f" render_view_preserved="
+                            f"{str(mask_policy == CAR_MASK_POLICY_ALL_EXCEPT_RENDER).lower()}"
+                        )
                     progress.write(
                         f"[dry-run] first frame scene={scene} frame={frame} "
                         f"extrinsics_source={args.extrinsics_source} "
@@ -1261,7 +1633,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         f"K_norm={inputs.intrinsics.shape} "
                         f"wide={out_hw[0]}x{out_hw[1]} "
                         f"wide_K_px=({wide_px.fx:.2f},{wide_px.fy:.2f},"
-                        f"{wide_px.cx:.2f},{wide_px.cy:.2f})"
+                        f"{wide_px.cx:.2f},{wide_px.cy:.2f}){mask_info}"
                     )
         return 0
 
@@ -1277,7 +1649,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     _, encoder, decoder = build_model(cfg_dict, checkpoint_path, device)
 
-    render_index = list(cameras).index(args.render_camera)
     progress = tqdm(
         jobs,
         total=len(jobs),
@@ -1308,6 +1679,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.far,
                 device,
                 args.amp,
+                gaussian_filter=gaussian_filter,
             )
             progress.set_postfix(
                 scene=scene, frame=frame, out=f"{out_h}x{out_w}"
