@@ -20,12 +20,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = REPO_ROOT / "scripts" / "benchmark_nuscenes_wide.py"
+MODULE_PATH = REPO_ROOT / "scripts" / "benchmark_wide_core.py"
 
 
 def _load_module():
     spec = importlib.util.spec_from_file_location(
-        "benchmark_nuscenes_wide", MODULE_PATH
+        "benchmark_wide_core", MODULE_PATH
     )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load module from {MODULE_PATH}")

@@ -19,7 +19,9 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = REPO_ROOT / "scripts" / "inference_nuscenes_wide.py"
+# The pure wide-view helpers now live in the shared core; the old
+# ``inference_nuscenes_wide.py`` path is a thin per-dataset wrapper.
+SCRIPT_PATH = REPO_ROOT / "scripts" / "wide_inference_core.py"
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

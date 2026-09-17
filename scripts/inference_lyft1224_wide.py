@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""nuScenes single-frame wide-view inference (thin per-dataset entry point).
+"""Lyft 1224x1024 single-frame wide-view inference (thin per-dataset entry point).
 
-Pins ``--dataset nuscenes`` on the shared ``wide_inference_core``; ``--dataset`` can
+Pins ``--dataset lyft1224`` on the shared ``wide_inference_core``; ``--dataset`` can
 still be passed to override the preset explicitly.
 """
 
@@ -11,7 +11,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-DEFAULT_DATASET = "nuscenes"
+DEFAULT_DATASET = "lyft1224"
 _CORE_NAME = "wide_inference_core"
 SCRIPT_DIR = Path(__file__).resolve().parent
 

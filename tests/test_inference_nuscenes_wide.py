@@ -21,12 +21,12 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = REPO_ROOT / "scripts" / "inference_nuscenes_wide.py"
+SCRIPT_PATH = REPO_ROOT / "scripts" / "wide_inference_core.py"
 
 
 def _load_module():
     spec = importlib.util.spec_from_file_location(
-        "inference_nuscenes_wide", SCRIPT_PATH
+        "wide_inference_core", SCRIPT_PATH
     )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load module from {SCRIPT_PATH}")

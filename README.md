@@ -422,13 +422,29 @@ We fine-tune our Gaussian Splatting pre-trained depth model using ground-truth d
 
 ## nuScenes Wide-View Inference
 
-`scripts/inference_nuscenes_wide.py` is a standalone nuScenes inference path. It
-reconstructs Gaussians from cameras `5, 4, 3` of a frame and renders a
-horizontally widened image from camera `5`, without going through the Lightning
-`ModelWrapper.test_step` (which assumes a ground-truth target view). By default
-it processes every scene in the scene list and every valid frame; extrinsics
-come from the static camera-to-ego rig (see
+`scripts/inference_nuscenes_wide.py` is the nuScenes entry point for the
+standalone single-frame inference path. It reconstructs Gaussians from cameras
+`5, 4, 3` of a frame and renders a horizontally widened image from camera `5`,
+without going through the Lightning `ModelWrapper.test_step` (which assumes a
+ground-truth target view). By default it processes every scene in the scene list
+and every valid frame; extrinsics come from the static camera-to-ego rig (see
 [Extrinsics source](#extrinsics-source) below).
+
+The implementation is shared: `scripts/wide_inference_core.py` holds all the
+logic (helpers, `DatasetPreset` table, CLI), and the per-dataset entry points are
+thin wrappers that pin a preset:
+
+| Single-frame entry point | Pinned `--dataset` |
+| --- | --- |
+| `scripts/inference_nuscenes_wide.py` | `nuscenes` |
+| `scripts/inference_lyft1920_wide.py` | `lyft1920` |
+| `scripts/inference_lyft1224_wide.py` | `lyft1224` |
+| `scripts/inference_ddad_wide.py` | `ddad` |
+
+`--dataset` remains available on every wrapper as an explicit override, so
+`python scripts/inference_lyft1920_wide.py ...` is equivalent to
+`python scripts/wide_inference_core.py --dataset lyft1920 ...`. The examples
+below use the nuScenes wrapper; swap the script name for another dataset.
 
 ### Usage
 
@@ -679,13 +695,25 @@ or clone `facebookresearch/dinov2` and point `--dinov2-source` at the clone.
 
 ## nuScenes Multi-Frame Wide-View Inference
 
-`scripts/inference_nuscenes_wide_multiframes.py` is the temporal-context
-counterpart of the single-frame path: it feeds `--num-frames` consecutive frames
-(default 3) x cameras `5,4,3` to the DepthSplat encoder at once and renders a
-widened image from the **newest** frame's camera `5`. It reuses the single-frame
-script's helpers (resize/crop, intrinsics, wide-K, model construction) but is a
-standalone entry point, analogous to
-`dggt_infer/inference_nuscenes_multiframes.py`.
+`scripts/inference_nuscenes_wide_multiframes.py` is the nuScenes entry point for
+the temporal-context counterpart of the single-frame path: it feeds
+`--num-frames` consecutive frames (default 3) x cameras `5,4,3` to the DepthSplat
+encoder at once and renders a widened image from the **newest** frame's camera
+`5`, analogous to `dggt_infer/inference_nuscenes_multiframes.py`.
+
+The implementation is shared: `scripts/wide_inference_multiframes_core.py` holds
+all the logic, and the per-dataset entry points are thin wrappers that pin a
+preset:
+
+| Multi-frame entry point | Pinned `--dataset` |
+| --- | --- |
+| `scripts/inference_nuscenes_wide_multiframes.py` | `nuscenes` |
+| `scripts/inference_lyft1920_wide_multiframes.py` | `lyft1920` |
+| `scripts/inference_lyft1224_wide_multiframes.py` | `lyft1224` |
+| `scripts/inference_ddad_wide_multiframes.py` | `ddad` |
+
+`--dataset` remains an explicit override on each wrapper. The examples below use
+the nuScenes wrapper.
 
 ### Usage
 
@@ -917,34 +945,41 @@ The masks' source resolution must match the images'.
 
 ### Commands
 
+Each dataset has its own wrapper (the pinned dataset is built in; `--dataset`
+can still override it).
+
 ```bash
 # Single-frame, Lyft 1920x1080 (defaults: model 256x448, width factor 3x,
 # cameras 5,4,3, render camera 5; cams 4/3 masked, cam 5 preserved).
-python scripts/inference_nuscenes_wide.py --dataset lyft1920 \
+python scripts/inference_lyft1920_wide.py \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --output-dir outputs/lyft1920_wide
 
 # Multi-frame, Lyft 1920x1080 (3 consecutive frames, newest rendered).
-python scripts/inference_nuscenes_wide_multiframes.py --dataset lyft1920 \
+python scripts/inference_lyft1920_wide_multiframes.py \
   --num-frames 3 --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --output-dir outputs/lyft1920_wide_multiframes
 
 # Single-frame, Lyft 1224x1024.
-python scripts/inference_nuscenes_wide.py --dataset lyft1224 \
+python scripts/inference_lyft1224_wide.py \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --output-dir outputs/lyft1224_wide
 
 # Single-frame, DDAD (composed extrinsics are only needed by multi-frame).
-python scripts/inference_nuscenes_wide.py --dataset ddad \
+python scripts/inference_ddad_wide.py \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --output-dir outputs/ddad_wide
 
 # Multi-frame, DDAD: --extrinsics-source auto resolves to compose
 # (ego_pose @ cam2ego) because DDAD has no extrinsics/ directory.
-python scripts/inference_nuscenes_wide_multiframes.py --dataset ddad \
+python scripts/inference_ddad_wide_multiframes.py \
   --num-frames 3 --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --output-dir outputs/ddad_wide_multiframes
 ```
+
+The equivalent core invocations (explicit preset) are e.g.
+`python scripts/wide_inference_core.py --dataset lyft1920 ...` and
+`python scripts/wide_inference_multiframes_core.py --dataset ddad ...`.
 
 Add `--dry-run` to any command to validate paths, masks and extrinsics without a
 GPU.
@@ -988,11 +1023,23 @@ The output width factor stays the nuScenes-consistent default of `3x`
 
 ## Speed benchmark
 
-`scripts/benchmark_nuscenes_wide.py` times the real inference pipeline of either
-path with `torch.cuda.Event` and saves no images. It builds the model once, loads
-one sample once (outside the timing loop), runs `--warmup` iterations (excluded),
+`scripts/benchmark_nuscenes_wide.py` is the nuScenes entry point for the wide
+speed benchmark. It times the real inference pipeline of either path with
+`torch.cuda.Event` and saves no images. It builds the model once, loads one
+sample once (outside the timing loop), runs `--warmup` iterations (excluded),
 then times `--measure` iterations and reports mean / median / min / max / stdev
 latency in milliseconds and throughput as `1000 / mean` FPS.
+
+The implementation is shared: `scripts/benchmark_wide_core.py` holds all the
+logic, and the per-dataset entry points are thin wrappers that pin a preset
+(`--dataset` can still override):
+
+| Benchmark entry point | Pinned `--dataset` |
+| --- | --- |
+| `scripts/benchmark_nuscenes_wide.py` | `nuscenes` |
+| `scripts/benchmark_lyft1920_wide.py` | `lyft1920` |
+| `scripts/benchmark_lyft1224_wide.py` | `lyft1224` |
+| `scripts/benchmark_ddad_wide.py` | `ddad` |
 
 ### Commands
 
@@ -1023,10 +1070,11 @@ python scripts/benchmark_nuscenes_wide.py \
   --mode multi --model 448x768 --input-size 448x768 --num-frames 3 \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
 
-# any dataset preset works too (masks and extrinsics are resolved from it):
-python scripts/benchmark_nuscenes_wide.py --dataset lyft1920 --mode multi \
+# each dataset has its own wrapper (the preset is pinned; masks and extrinsics
+# are resolved from it):
+python scripts/benchmark_lyft1920_wide.py --mode multi \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
-python scripts/benchmark_nuscenes_wide.py --dataset ddad --mode multi \
+python scripts/benchmark_ddad_wide.py --mode multi \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main
 ```
 
@@ -1050,9 +1098,9 @@ images → wide._render_wide_impl(...) → encoder → (ego-car Gaussian filter)
 ```
 
 - `--mode single` loads a frame with `wide.load_frame_inputs` (static `cam2ego`
-  extrinsics, as in `inference_nuscenes_wide.py`).
+  extrinsics, as in `wide_inference_core.py`).
 - `--mode multi` loads a causal window with `mf.load_window_inputs` (per-frame
-  global extrinsics, as in `inference_nuscenes_wide_multiframes.py`).
+  global extrinsics, as in `wide_inference_multiframes_core.py`).
 - The model is built once with `wide.build_model`; the ego-car `gaussian_filter`
   is built with the same policy resolution as the inference scripts (masking is
   **on** by default, `--disable-car-mask` / `--mask-render-view` behave

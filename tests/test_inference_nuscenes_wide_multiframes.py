@@ -24,13 +24,13 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = (
-    REPO_ROOT / "scripts" / "inference_nuscenes_wide_multiframes.py"
+    REPO_ROOT / "scripts" / "wide_inference_multiframes_core.py"
 )
 
 
 def _load_module():
     spec = importlib.util.spec_from_file_location(
-        "inference_nuscenes_wide_multiframes", MODULE_PATH
+        "wide_inference_multiframes_core", MODULE_PATH
     )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load module from {MODULE_PATH}")
