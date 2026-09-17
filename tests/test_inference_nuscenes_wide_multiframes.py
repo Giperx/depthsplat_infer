@@ -281,17 +281,24 @@ class ParserDefaultsTest(unittest.TestCase):
         self.assertIsNone(mf.DEFAULT_LOCAL_MV_MATCH)
 
     def test_car_mask_defaults_enabled(self):
-        # Masking is on by default: car-mask-root has its default and the
-        # disable flag is off.
+        # Masking is on by default: car-mask-root has its default, the disable
+        # flag is off and the render view stays preserved.
         self.assertEqual(
             self.args.car_mask_root,
             "datasets/nuscenes/processed_10Hz/nuscenes_mask",
         )
         self.assertFalse(self.args.disable_car_mask)
+        self.assertFalse(self.args.mask_render_view)
 
     def test_disable_car_mask_flag(self):
         args = mf.build_arg_parser().parse_args(["--disable-car-mask"])
         self.assertTrue(args.disable_car_mask)
+        self.assertFalse(args.mask_render_view)
+
+    def test_mask_render_view_flag(self):
+        args = mf.build_arg_parser().parse_args(["--mask-render-view"])
+        self.assertTrue(args.mask_render_view)
+        self.assertFalse(args.disable_car_mask)
 
     def test_car_mask_root_override(self):
         args = mf.build_arg_parser().parse_args(
@@ -299,6 +306,7 @@ class ParserDefaultsTest(unittest.TestCase):
         )
         self.assertEqual(args.car_mask_root, "/some/other/masks")
         self.assertFalse(args.disable_car_mask)
+        self.assertFalse(args.mask_render_view)
 
     def test_output_defaults(self):
         self.assertEqual(
@@ -596,43 +604,161 @@ class CarMaskResizeTest(unittest.TestCase):
             self.assertIn("resolution", message)
 
 
-class HistoryOnlyMaskTest(unittest.TestCase):
-    """Historical views use their camera mask; the newest frame keeps all."""
+class CarMaskPolicyTest(unittest.TestCase):
+    """Default masks every view except the current render view."""
 
-    def _masks(self, h=2, w=2):
-        zeros = np.zeros((h, w), dtype=bool)
-        ones = np.ones((h, w), dtype=bool)
+    CAMERAS = (5, 4, 3)
+    NUM_FRAMES = 3
+    DST_HW = (2, 2)
+    # Newest frame (t3) camera 5 -> flattened index 6.
+    RENDER_INDEX = mf.newest_render_index(3, (5, 4, 3), 5)
+
+    def _masks(self):
+        # Distinct, non-trivial masks so per-view camera mapping is checkable.
         return {
-            5: np.full((h, w), True, dtype=bool),
-            4: np.full((h, w), False, dtype=bool),
-            3: np.array([[True, False], [False, True]]) if (h, w) == (2, 2) else zeros,
+            5: np.array([[True, True], [True, False]], dtype=bool),
+            4: np.array([[False, True], [True, True]], dtype=bool),
+            3: np.array([[True, False], [False, True]], dtype=bool),
         }
 
-    def test_each_camera_applied_to_history_newest_all_kept(self):
-        cameras = (5, 4, 3)
-        keep = mf.build_history_only_keep_mask(
-            self._masks(), cameras, num_frames=3, dst_hw=(2, 2)
+    def test_frame_major_camera_mapping(self):
+        # view v uses cameras[v % len(cameras)].
+        expected = [5, 4, 3, 5, 4, 3, 5, 4, 3]
+        self.assertEqual(
+            [self.CAMERAS[v % len(self.CAMERAS)] for v in range(9)], expected
+        )
+        self.assertEqual(self.RENDER_INDEX, 6)
+
+    def test_default_masks_every_view_except_render_view(self):
+        masks = self._masks()
+        keep = mf.build_car_keep_mask(
+            masks, self.CAMERAS, self.NUM_FRAMES, self.DST_HW, self.RENDER_INDEX
         )
         self.assertEqual(keep.shape, (9, 2, 2))
         self.assertTrue(keep.dtype == bool)
+        for view in range(9):
+            cam = self.CAMERAS[view % len(self.CAMERAS)]
+            if view == self.RENDER_INDEX:
+                self.assertTrue(keep[view].all())
+            else:
+                np.testing.assert_array_equal(keep[view], masks[cam])
+        # The render view is the only all-ones view.
+        all_ones = [v for v in range(9) if keep[v].all()]
+        self.assertEqual(all_ones, [self.RENDER_INDEX])
 
-        # Frame-major: [t0 c5, t0 c4, t0 c3, t1 c5, t1 c4, t1 c3, t2 (newest) ...]
-        np.testing.assert_array_equal(keep[0], self._masks()[5])
-        np.testing.assert_array_equal(keep[1], self._masks()[4])
-        np.testing.assert_array_equal(keep[2], self._masks()[3])
-        np.testing.assert_array_equal(keep[3], self._masks()[5])
-        np.testing.assert_array_equal(keep[4], self._masks()[4])
-        np.testing.assert_array_equal(keep[5], self._masks()[3])
-        # Newest frame keeps every pixel for all cameras.
-        self.assertTrue(keep[6:9].all())
+    def test_default_masks_newest_side_cameras_but_not_render(self):
+        masks = self._masks()
+        keep = mf.build_car_keep_mask(
+            masks, self.CAMERAS, self.NUM_FRAMES, self.DST_HW, self.RENDER_INDEX
+        )
+        # Current frame t3: cam5 render preserved; cams 4 and 3 masked.
+        self.assertTrue(keep[6].all())
+        np.testing.assert_array_equal(keep[7], masks[4])
+        np.testing.assert_array_equal(keep[8], masks[3])
+        # Historical frames t1/t2: every camera masked.
+        for view in (0, 1, 2, 3, 4, 5):
+            self.assertFalse(keep[view].all())
 
-    def test_single_frame_keeps_everything(self):
-        cameras = (5, 4, 3)
-        keep = mf.build_history_only_keep_mask(
-            self._masks(), cameras, num_frames=1, dst_hw=(2, 2)
+    def test_diagnostic_masks_all_views_including_render(self):
+        masks = self._masks()
+        keep = mf.build_car_keep_mask(
+            masks,
+            self.CAMERAS,
+            self.NUM_FRAMES,
+            self.DST_HW,
+            self.RENDER_INDEX,
+            mask_render_view=True,
+        )
+        for view in range(9):
+            cam = self.CAMERAS[view % len(self.CAMERAS)]
+            np.testing.assert_array_equal(keep[view], masks[cam])
+        self.assertFalse(keep[self.RENDER_INDEX].all())
+
+    def test_diagnostic_removes_exactly_the_render_view_pixels_more(self):
+        masks = self._masks()
+        default = mf.build_car_keep_mask(
+            masks, self.CAMERAS, self.NUM_FRAMES, self.DST_HW, self.RENDER_INDEX
+        )
+        diagnostic = mf.build_car_keep_mask(
+            masks,
+            self.CAMERAS,
+            self.NUM_FRAMES,
+            self.DST_HW,
+            self.RENDER_INDEX,
+            mask_render_view=True,
+        )
+        extra_removed = int((~diagnostic).sum()) - int((~default).sum())
+        self.assertEqual(extra_removed, int((~masks[5]).sum()))
+        # Default kept pixels are a superset of the diagnostic's kept pixels.
+        self.assertTrue(np.array_equal(default | diagnostic, default))
+
+    def test_single_frame_default_masks_side_cameras_only(self):
+        render_index = mf.newest_render_index(1, self.CAMERAS, 5)  # 0
+        masks = self._masks()
+        keep = mf.build_car_keep_mask(
+            masks, self.CAMERAS, 1, self.DST_HW, render_index
         )
         self.assertEqual(keep.shape, (3, 2, 2))
-        self.assertTrue(keep.all())
+        self.assertTrue(keep[0].all())
+        np.testing.assert_array_equal(keep[1], masks[4])
+        np.testing.assert_array_equal(keep[2], masks[3])
+
+    def test_single_frame_diagnostic_masks_render_too(self):
+        render_index = mf.newest_render_index(1, self.CAMERAS, 5)
+        masks = self._masks()
+        keep = mf.build_car_keep_mask(
+            masks, self.CAMERAS, 1, self.DST_HW, render_index, mask_render_view=True
+        )
+        for view in range(3):
+            np.testing.assert_array_equal(keep[view], masks[self.CAMERAS[view]])
+
+    def test_render_index_must_be_newest_frame(self):
+        with self.assertRaises(ValueError) as ctx:
+            mf.build_car_keep_mask(
+                self._masks(), self.CAMERAS, self.NUM_FRAMES, self.DST_HW, 0
+            )
+        self.assertIn("newest frame", str(ctx.exception))
+
+    def test_render_index_out_of_range_rejected(self):
+        with self.assertRaises(ValueError):
+            mf.build_car_keep_mask(
+                self._masks(), self.CAMERAS, self.NUM_FRAMES, self.DST_HW, 9
+            )
+
+    def test_camera_mask_shape_mismatch_fails(self):
+        masks = self._masks()
+        masks[4] = np.ones((3, 3), dtype=bool)
+        with self.assertRaises(ValueError):
+            mf.build_car_keep_mask(
+                masks, self.CAMERAS, self.NUM_FRAMES, self.DST_HW, self.RENDER_INDEX
+            )
+
+    def test_missing_camera_mask_fails(self):
+        masks = self._masks()
+        del masks[4]
+        with self.assertRaises(KeyError):
+            mf.build_car_keep_mask(
+                masks, self.CAMERAS, self.NUM_FRAMES, self.DST_HW, self.RENDER_INDEX
+            )
+
+
+class CarMaskPolicyResolutionTest(unittest.TestCase):
+    """``--disable-car-mask`` has the highest precedence."""
+
+    def test_default_is_all_except_render_view(self):
+        self.assertEqual(
+            mf.resolve_car_mask_policy(False, False),
+            mf.CAR_MASK_POLICY_ALL_EXCEPT_RENDER,
+        )
+
+    def test_mask_render_view_selects_all_views(self):
+        self.assertEqual(
+            mf.resolve_car_mask_policy(False, True), mf.CAR_MASK_POLICY_ALL
+        )
+
+    def test_disable_wins_over_everything(self):
+        self.assertIsNone(mf.resolve_car_mask_policy(True, False))
+        self.assertIsNone(mf.resolve_car_mask_policy(True, True))
 
 
 class GaussianPruningTest(unittest.TestCase):

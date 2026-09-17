@@ -654,12 +654,17 @@ python scripts/inference_nuscenes_wide_multiframes.py \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --output-dir outputs/nuscenes_wide_multiframes
 
-# Ego-car masking is on by default; point at a different mask root or disable
-# it for a controlled comparison (keeps every Gaussian from every view):
+# Ego-car masking is on by default (every view except the current render view);
+# point at a different mask root, mask the render view too for a diagnostic, or
+# disable masking entirely for a controlled comparison (keeps every Gaussian):
 python scripts/inference_nuscenes_wide_multiframes.py \
   --car-mask-root datasets/nuscenes/processed_10Hz/nuscenes_mask \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
   --output-dir outputs/nuscenes_wide_multiframes
+python scripts/inference_nuscenes_wide_multiframes.py \
+  --mask-render-view \
+  --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
+  --output-dir outputs/nuscenes_multiframe_all_masks_check
 python scripts/inference_nuscenes_wide_multiframes.py \
   --disable-car-mask \
   --dinov2-source ~/.cache/torch/hub/facebookresearch_dinov2_main \
@@ -711,9 +716,8 @@ mismatch fails loudly.
 
 ### Ego-car masking
 
-Multi-frame inference masks the ego-car pixels by default (`--disable-car-mask`
-turns it off for a controlled comparison). Each selected camera has a static
-mask under `--car-mask-root` (default
+Multi-frame inference masks the ego-car pixels by default. Each selected camera
+has a static mask under `--car-mask-root` (default
 `datasets/nuscenes/processed_10Hz/nuscenes_mask`), mapped by nuScenes camera id:
 
 | Camera id | Camera | Mask file |
@@ -732,20 +736,27 @@ mask under `--car-mask-root` (default
   same centre crop. It is **not** plain-resized straight to the destination, so
   mask pixels stay aligned with the resized/cropped images. The mask's source
   resolution must equal the source images' resolution.
-- **Which views**: the masks are applied to every **historical-frame** view
-  (`t < num_frames - 1`), each camera using its own mask. The
-  **newest/current** frame (`t = num_frames - 1`) keeps all pixels for all
-  selected cameras, so the ego car is preserved in the rendered frame.
+- **Which views (default, `all_except_render_view`)**: each camera's mask is
+  applied to **every view except the single current/newest render view**. For a
+  3-frame `[5, 4, 3]` window with render camera 5 (`t3_cam5`), that masks the
+  historical `t1/t2` cams 5/4/3 **and** the current `t3` cams 4/3, leaving only
+  `t3_cam5` fully preserved.
+- **Diagnostic (`--mask-render-view`, `all_views`)**: additionally applies the
+  masks to the current render view itself, so the preset ego-car region (e.g. a
+  rear ego-car hood) is removed there too. Use this to render an image expected
+  to have no rear ego-car hood.
+- **Disable (`--disable-car-mask`)**: highest precedence; keeps every Gaussian
+  from every view and overrides both policies above.
+- **Precedence**: `--disable-car-mask` > `--mask-render-view` > default.
 - **Failure mode**: a missing required mask for any selected camera is a hard
-  error (there is no silent all-ones fallback). `--disable-car-mask` is the only
-  way to keep every Gaussian.
+  error (there is no silent all-ones fallback).
 - Pruning drops the affected Gaussians from `means`, `covariances`, `harmonics`
   and `opacities` identically (rather than only zeroing opacity) after the
   encoder and before the decoder.
 
 This overrides the DGGT nuScenes behaviour (which only masked `CAM_BACK` on
-historical frames): here every camera's mask is applied to its own historical
-views.
+historical frames): here every camera's mask is applied to its own views under
+the policy above, except the preserved current render view by default.
 
 ### local-mv-match
 

@@ -47,9 +47,18 @@ id 0..5 to ``CAM_FRONT``/``CAM_FRONT_LEFT``/``CAM_FRONT_RIGHT``/
 ``CAM_BACK_LEFT``/``CAM_BACK_RIGHT``/``CAM_BACK``.  A mask pixel is removed when
 it is black (``<128``) and kept when white (``>=128``); the mask is transformed
 with exactly the images' resize/crop plan (NEAREST resize to the scaled size,
-then the identical centre crop).  Each camera's mask is applied to that camera's
-**historical-frame** views; the newest/current frame keeps all pixels for every
-camera.  A missing required mask is a hard error (no all-ones fallback).
+then the identical centre crop).  A missing required mask is a hard error (no
+all-ones fallback).
+
+Default policy (``all_except_render_view``): each camera's mask is applied to
+**every view except the single current/newest render view**.  For a 3-frame
+``[5, 4, 3]`` window with render camera 5 (``t3_cam5``) that masks historical
+``t1/t2`` cams 5/4/3 and the current ``t3`` cams 4/3, leaving only ``t3_cam5``
+fully preserved.  Diagnostic policy (``--mask-render-view``, ``all_views``)
+additionally applies the masks to the render view itself, so the preset ego-car
+region is removed there too (useful to check for a missing rear ego-car hood).
+``--disable-car-mask`` has the highest precedence and disables masking
+completely.
 
 Per window the views are flattened **frame-major**::
 
@@ -181,6 +190,10 @@ CAMERA_MASK_FILES: dict[int, str] = {
 # Polarity threshold: black (< 128) is the ego car to remove, white (>= 128)
 # is kept.
 CAR_MASK_KEEP_THRESHOLD = 128
+
+# Masking policy names (reported in info/dry-run diagnostics).
+CAR_MASK_POLICY_ALL_EXCEPT_RENDER = "all_except_render_view"
+CAR_MASK_POLICY_ALL = "all_views"
 
 
 # ---------------------------------------------------------------------------
@@ -363,35 +376,83 @@ def load_camera_keep_masks(
     return masks
 
 
-def build_history_only_keep_mask(
+def build_car_keep_mask(
     camera_masks: dict[int, np.ndarray],
     cameras: Sequence[int],
     num_frames: int,
     dst_hw: tuple[int, int],
+    render_index: int,
+    mask_render_view: bool = False,
 ) -> np.ndarray:
     """Build the ``[num_frames * len(cameras), H, W]`` per-view keep mask.
 
-    Flattening is frame-major (same as the encoder input).  Every historical
-    view (frame index ``< num_frames - 1``) uses its own camera's keep mask;
-    the newest/current frame (index ``num_frames - 1``) keeps every pixel for
-    all selected cameras.  Result is bool with ``True`` = keep.
+    Flattening is frame-major (same as the encoder input), so view
+    ``v = frame_index * len(cameras) + camera_index`` uses
+    ``cameras[camera_index]``.
+
+    Default policy (``mask_render_view=False``): each view uses its own
+    camera's keep mask for **every view except** the single current/newest
+    render view at ``render_index`` (``t3_cam<render_camera>``), which is kept
+    whole.  For a 3-frame ``[5, 4, 3]`` window that masks historical
+    ``t1/t2`` cams 5/4/3 and the current ``t3`` cams 4/3, leaving only
+    ``t3_cam5`` fully preserved.
+
+    Diagnostic policy (``mask_render_view=True``): the camera mask is applied
+    to **all** views, including the render view, so the preset ego-car region is
+    removed there too.
+
+    ``render_index`` must address the newest frame of the window; result is
+    bool with ``True`` = keep.
     """
     num_frames = int(num_frames)
     cameras = [int(cam) for cam in cameras]
     out_h, out_w = int(dst_hw[0]), int(dst_hw[1])
-    keep = np.ones((num_frames, len(cameras), out_h, out_w), dtype=bool)
-    for frame_index in range(num_frames - 1):
-        for camera_index, cam in enumerate(cameras):
-            mask = camera_masks.get(cam)
-            if mask is None:
-                raise KeyError(f"No ego-car mask was loaded for camera {cam}.")
-            if mask.shape != (out_h, out_w):
-                raise ValueError(
-                    f"Ego-car mask for camera {cam} has shape {mask.shape} but "
-                    f"the model input is {out_h}x{out_w}."
-                )
-            keep[frame_index, camera_index] = mask
-    return keep.reshape(num_frames * len(cameras), out_h, out_w)
+    num_views = num_frames * len(cameras)
+    render_index = int(render_index)
+    if not cameras:
+        raise ValueError("At least one camera is required to build a mask.")
+    if not 0 <= render_index < num_views:
+        raise ValueError(
+            f"render_index {render_index} is out of range for {num_views} views."
+        )
+    if render_index // len(cameras) != num_frames - 1:
+        raise ValueError(
+            f"render_index {render_index} does not address the newest frame "
+            f"(frame index {num_frames - 1} of {num_frames}); the render view "
+            "must be the current/newest window view."
+        )
+
+    keep = np.ones((num_views, out_h, out_w), dtype=bool)
+    for view_index in range(num_views):
+        if view_index == render_index and not mask_render_view:
+            continue
+        cam = cameras[view_index % len(cameras)]
+        mask = camera_masks.get(cam)
+        if mask is None:
+            raise KeyError(f"No ego-car mask was loaded for camera {cam}.")
+        if mask.shape != (out_h, out_w):
+            raise ValueError(
+                f"Ego-car mask for camera {cam} has shape {mask.shape} but "
+                f"the model input is {out_h}x{out_w}."
+            )
+        keep[view_index] = mask
+    return keep
+
+
+def resolve_car_mask_policy(
+    disable_car_mask: bool, mask_render_view: bool
+) -> Optional[str]:
+    """Resolve the masking policy name (``--disable-car-mask`` wins).
+
+    Returns ``None`` when masking is disabled, else
+    ``CAR_MASK_POLICY_ALL_EXCEPT_RENDER`` (default) or ``CAR_MASK_POLICY_ALL``
+    when ``--mask-render-view`` is requested.
+    """
+    if disable_car_mask:
+        return None
+    return (
+        CAR_MASK_POLICY_ALL if mask_render_view else CAR_MASK_POLICY_ALL_EXCEPT_RENDER
+    )
 
 
 def expand_keep_mask_to_gaussians(
@@ -676,18 +737,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "CAM_BACK_LEFT_mask.png, CAM_BACK_RIGHT_mask.png, CAM_BACK_mask.png for "
             "cameras 0..5). Black (<128) pixels are removed and white (>=128) kept, "
             "transformed with exactly the same resize/crop plan as the images. "
-            "Each camera's mask is applied to that camera's historical-frame views; "
-            "the newest frame keeps all Gaussians. A missing mask for any selected "
-            "camera is a hard error."
+            "By default each camera's mask is applied to every view EXCEPT the "
+            "current/newest render view: historical t1/t2 cams 5/4/3 are masked and "
+            "the current t3 cams 4/3 are masked, while only the current render view "
+            "(t3 cam5) is fully preserved. A missing mask for any selected camera is "
+            "a hard error."
+        ),
+    )
+    data.add_argument(
+        "--mask-render-view",
+        action="store_true",
+        help=(
+            "Diagnostic: also apply each camera's mask to the current/newest render "
+            "view (t<num_frames-1> cam<render-camera>), so the preset ego-car "
+            "region is removed there too. Default off: the render view is fully "
+            "preserved."
         ),
     )
     data.add_argument(
         "--disable-car-mask",
         action="store_true",
         help=(
-            "Disable ego-car masking (keep every Gaussian from every view) for a "
-            "controlled comparison. By default masking is enabled and each selected "
-            "camera's mask is applied to its historical-frame views."
+            "Disable ego-car masking entirely (keep every Gaussian from every view) "
+            "for a controlled comparison. Highest precedence: it overrides "
+            "--mask-render-view and the default policy."
         ),
     )
 
@@ -977,31 +1050,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Ego-car masking is enabled by default.  The masks are static, T/camera
     # order is fixed and the resize/crop plan is constant, so every mask (and
-    # the per-view historical/current keep mask) is loaded/built exactly once
-    # here, after src_hw/dst_hw are known and before any window is touched.
+    # the per-view keep mask) is loaded/built exactly once here, after
+    # src_hw/dst_hw are known and before any window is touched.  The render view
+    # is the flattened index of the newest frame's render camera.
+    render_index = newest_render_index(num_frames, cameras, args.render_camera)
+    mask_policy = resolve_car_mask_policy(
+        args.disable_car_mask, args.mask_render_view
+    )
     gaussian_filter = None
     keep_mask = None
-    if args.disable_car_mask:
+    if mask_policy is None:
         print(
-            "[info] Ego-car masking DISABLED (--disable-car-mask): every "
-            "Gaussian from every view is kept.",
+            "[info] Ego-car masking DISABLED (--disable-car-mask, highest "
+            "precedence): every Gaussian from every view is kept.",
             file=sys.stderr,
         )
     else:
         mask_root = wide.resolve_local(args.car_mask_root)
         plan = wide.plan_resize_and_crop(src_hw, dst_hw)
         camera_keep_masks = load_camera_keep_masks(mask_root, cameras, plan)
-        keep_mask = build_history_only_keep_mask(
-            camera_keep_masks, cameras, num_frames, dst_hw
+        keep_mask = build_car_keep_mask(
+            camera_keep_masks,
+            cameras,
+            num_frames,
+            dst_hw,
+            render_index,
+            mask_render_view=args.mask_render_view,
         )
         gaussian_filter = make_gaussian_filter(keep_mask)
         retained = int(keep_mask.sum())
         total = int(keep_mask.size)
+        if mask_policy == CAR_MASK_POLICY_ALL:
+            policy_detail = (
+                "every view (including the current render view; diagnostic "
+                "--mask-render-view)"
+            )
+        else:
+            policy_detail = (
+                "every view except the current/newest render view (newest "
+                f"frame cam{args.render_camera}) at render_index={render_index}, "
+                "which is fully preserved"
+            )
         print(
-            f"[info] Ego-car masking enabled from {mask_root}: each camera's "
-            f"mask applied to its historical-frame views, newest frame keeps "
-            f"all Gaussians; kept {retained}/{total} resized mask pixels "
-            f"({total - retained} removed) over V={keep_mask.shape[0]} views.",
+            f"[info] Ego-car masking enabled from {mask_root} "
+            f"(policy={mask_policy}): {policy_detail}; kept {retained}/{total} "
+            f"resized mask pixels ({total - retained} removed) over "
+            f"V={keep_mask.shape[0]} views.",
             file=sys.stderr,
         )
 
@@ -1033,11 +1127,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # flooding the terminal.
                 if index == 0:
                     if keep_mask is None:
-                        mask_info = " car_mask=disabled"
+                        mask_info = " car_mask=disabled car_mask_policy=disabled"
                     else:
                         mask_info = (
+                            f" car_mask_policy={mask_policy}"
                             f" car_mask_removed={int((~keep_mask).sum())}"
                             f"/{int(keep_mask.size)}"
+                            f" render_view_preserved="
+                            f"{str(mask_policy == CAR_MASK_POLICY_ALL_EXCEPT_RENDER).lower()}"
                         )
                     progress.write(
                         f"[dry-run] first window scene={scene} "
@@ -1065,7 +1162,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     _, encoder, decoder = wide.build_model(cfg_dict, checkpoint_path, device)
 
-    render_index = newest_render_index(num_frames, cameras, args.render_camera)
     progress = tqdm(
         jobs, total=len(jobs), unit="window", desc="Rendering wide views"
     )
