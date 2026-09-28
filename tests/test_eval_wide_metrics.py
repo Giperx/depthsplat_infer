@@ -116,7 +116,7 @@ class FramePairingTest(unittest.TestCase):
             (render_rgb / "006_5_wide.jpg").write_bytes(b"")
             (render_rgb / "006_fixedfov_wide.jpg").write_bytes(b"")
             (render_rgb / "007_5_wide.jpg").write_bytes(b"")
-            (gt_rgb / "006_5_multiplane_wide.png").write_bytes(b"")
+            (gt_rgb / "006_5_sparse_wide.png").write_bytes(b"")
             # Frame 007 has no GT: it must not be paired.
 
             pairs = metrics.pair_scene_frames(render_rgb, gt_rgb)
@@ -124,7 +124,7 @@ class FramePairingTest(unittest.TestCase):
             frame, render_path, gt_path = pairs[0]
             self.assertEqual(frame, "006")
             self.assertTrue(render_path.name == "006_5_wide.jpg")
-            self.assertEqual(gt_path.name, "006_5_multiplane_wide.png")
+            self.assertEqual(gt_path.name, "006_5_sparse_wide.png")
 
     def test_pairs_do_not_require_zero_start(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,7 +133,7 @@ class FramePairingTest(unittest.TestCase):
             render_rgb.mkdir(parents=True)
             gt_rgb.mkdir(parents=True)
             (render_rgb / "042_5_wide.jpg").write_bytes(b"")
-            (gt_rgb / "042_5_multiplane_wide.png").write_bytes(b"")
+            (gt_rgb / "042_5_sparse_wide.png").write_bytes(b"")
             pairs = metrics.pair_scene_frames(render_rgb, gt_rgb)
             self.assertEqual([p[0] for p in pairs], ["042"])
 
@@ -172,8 +172,9 @@ class GtRootTest(unittest.TestCase):
     def test_nuscenes_default_path_is_documented(self):
         cfg = metrics.DATASETS["nuscenes"]
         self.assertEqual(
-            cfg.gt_root, "datasets/nuscenes/sparseMultiplaneImages3_1554x294"
+            cfg.gt_root, "datasets/nuscenes/sparseWideFOVImages3_1344x256"
         )
+        self.assertEqual(cfg.expected_hw, (256, 1344))
 
     def test_all_dataset_gt_roots_present_in_table(self):
         self.assertEqual(
@@ -181,8 +182,18 @@ class GtRootTest(unittest.TestCase):
         )
         self.assertEqual(
             metrics.DATASETS["ddad"].gt_root,
-            "datasets/ddad/sparseMultiplaneImages3_1554x322",
+            "datasets/ddad/sparseWideFOVImages3_1344x256",
         )
+        self.assertEqual(
+            metrics.DATASETS["lyft1920"].gt_root,
+            "datasets/lyft/1920_sparseWideFOVImages3_1344x256",
+        )
+        self.assertEqual(
+            metrics.DATASETS["lyft1224"].gt_root,
+            "datasets/lyft/1224_sparseWideFOVImages3_1344x256",
+        )
+        for cfg in metrics.DATASETS.values():
+            self.assertEqual(cfg.expected_hw, (256, 1344))
 
 
 class EqualWeightMeanTest(unittest.TestCase):

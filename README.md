@@ -1024,19 +1024,24 @@ The output width factor stays the nuScenes-consistent default of `3x`
 ## Wide-image metrics
 
 `scripts/eval_wide_metrics.py` scores this project's **direct 3x-width wide
-renders** against the sparse multiplane GT used by the DWSplat
-`*_multiplane_v2.py` scripts (the protocol is re-implemented here; nothing is
-imported from that repository). It evaluates the files named
+renders** against the sparse wide-FOV GT at `1344x256`. The photometric
+protocol follows the DWSplat v2 scripts and is re-implemented here; nothing is
+imported from that repository. It evaluates the files named
 `{frame}_5_wide.jpg` produced by the `inference_*_wide*.py` entry points — it
 does **not** evaluate the fixed-FOV `{frame}_fixedfov_wide.jpg` variants and it
 does **not** implement or evaluate WideDrive. The default model is `256x448`
 and `DEFAULT_WIDTH_FACTOR` is `3.0`, so a 448-wide input already renders at
-1344 wide; the metrics script resizes the render to the GT width regardless.
+1344 wide; the metrics script resizes the render to the GT size when they differ.
 
 - Render layout `<render-root>/<scene>/rgb/{frame}_5_wide.jpg` (an optional
   `<render-root>/<scene>/mask/{frame}_5_wide.png` render mask is used when
   present; our decoder does not save alpha so it is normally absent).
-- GT layout `<gt-root>/<scene>/{rgb,mask}/{frame}_5_multiplane_wide.png`.
+- GT layout `<gt-root>/<scene>/{rgb,mask}/{frame}_5_sparse_wide.png`, size
+  `1344x256`. Default roots:
+  `datasets/nuscenes/sparseWideFOVImages3_1344x256`,
+  `datasets/lyft/1920_sparseWideFOVImages3_1344x256`,
+  `datasets/lyft/1224_sparseWideFOVImages3_1344x256`,
+  `datasets/ddad/sparseWideFOVImages3_1344x256`.
 - The **render is bilinear-resized to the GT size** when the sizes differ; the
   GT is never resized. Panel width is `gt_width // 3`, with Left / Center /
   Right as three contiguous panels.
@@ -1060,14 +1065,14 @@ python scripts/eval_wide_metrics.py \
 # Explicit GT root and report path
 python scripts/eval_wide_metrics.py \
   --dataset lyft1920 --render-root outputs/lyft1920_wide \
-  --gt-root datasets/lyft/1920_sparseMultiplaneWideFOVImages3 \
+  --gt-root datasets/lyft/1920_sparseWideFOVImages3_1344x256 \
   --output outputs/lyft1920_wide/metrics.txt
 ```
 
 By default the report is written to
 `<render-root>/wide_metrics_<dataset>_<timestamp>.txt` and printed to stdout.
 The nuScenes sparse GT directory
-(`datasets/nuscenes/sparseMultiplaneImages3_1554x294`) is **not** in this
+(`datasets/nuscenes/sparseWideFOVImages3_1344x256`) is **not** in this
 checkout, so a nuScenes run fails with a clear error until that directory is
 present; pass `--gt-root` once it is.
 

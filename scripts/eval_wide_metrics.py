@@ -3,9 +3,9 @@
 
 This evaluates the single/multi-frame wide renders produced by
 ``inference_*_wide*.py`` (files named ``{frame}_5_wide.jpg``) against the sparse
-multipl wide GT used by the DWSplat ``*_multiplane_v2.py`` metric scripts.  It
-is a self-contained re-implementation: **nothing is imported from the DWSplat
-repository**.
+wide-FOV GT at ``1344x256`` (files named ``{frame}_5_sparse_wide.png``).  The
+photometric protocol follows the DWSplat v2 scripts, re-implemented here:
+**nothing is imported from the DWSplat repository**.
 
 Protocol (adapted from the DWSplat v2 sparse-wide protocol)
 -----------------------------------------------------------
@@ -79,39 +79,39 @@ class WideDataset:
 DATASETS: dict[str, WideDataset] = {
     "nuscenes": WideDataset(
         name="nuscenes",
-        gt_root="datasets/nuscenes/sparseMultiplaneImages3_1554x294",
+        gt_root="datasets/nuscenes/sparseWideFOVImages3_1344x256",
         scene_list="datasets/nuscenes/processed_10Hz/trainval2/nuScenes_Val2.txt",
         car_mask="datasets/nuscenes/processed_10Hz/nuscenes_mask/CAM_BACK_mask.png",
         car_mask_per_scene=False,
         car_mask_ext="png",
-        expected_hw=(294, 1554),
+        expected_hw=(256, 1344),
     ),
     "lyft1920": WideDataset(
         name="lyft1920",
-        gt_root="datasets/lyft/1920_sparseMultiplaneWideFOVImages3",
+        gt_root="datasets/lyft/1920_sparseWideFOVImages3_1344x256",
         scene_list="datasets/lyft/lyft_val1920_3cams/lyft_val1920.txt",
         car_mask="datasets/lyft/lyft_val1920_3cams/ego_car_masks/5.jpg",
         car_mask_per_scene=False,
         car_mask_ext="jpg",
-        expected_hw=(294, 1554),
+        expected_hw=(256, 1344),
     ),
     "lyft1224": WideDataset(
         name="lyft1224",
-        gt_root="datasets/lyft/1224_sparseMultiplaneWideFOVImages3",
+        gt_root="datasets/lyft/1224_sparseWideFOVImages3_1344x256",
         scene_list="datasets/lyft/lyft_val1224_3cams/lyft_val1224.txt",
         car_mask="datasets/lyft/lyft_val1224_3cams/ego_car_masks/5.jpg",
         car_mask_per_scene=False,
         car_mask_ext="jpg",
-        expected_hw=(434, 1554),
+        expected_hw=(256, 1344),
     ),
     "ddad": WideDataset(
         name="ddad",
-        gt_root="datasets/ddad/sparseMultiplaneImages3_1554x322",
+        gt_root="datasets/ddad/sparseWideFOVImages3_1344x256",
         scene_list="datasets/ddad/valid/valid.txt",
         car_mask="datasets/ddad/valid",
         car_mask_per_scene=True,
         car_mask_ext="jpg",
-        expected_hw=(322, 1554),
+        expected_hw=(256, 1344),
     ),
 }
 
@@ -120,7 +120,7 @@ DEFAULT_DATASET = "nuscenes"
 # Renders are the *direct* wide outputs, ``{frame}_5_wide.jpg``.  The regex
 # deliberately does not match ``{frame}_fixedfov_wide.jpg``.
 _RENDER_RE = re.compile(r"^(\d+)_5_wide\.(?:jpg|jpeg|png)$", re.IGNORECASE)
-_GT_RE = re.compile(r"^(\d+)_5_multiplane_wide\.png$", re.IGNORECASE)
+_GT_RE = re.compile(r"^(\d+)_5_sparse_wide\.png$", re.IGNORECASE)
 
 REGION_NAMES = ("Left", "Center", "Center_masked", "Right")
 
@@ -161,7 +161,7 @@ def read_scene_list(path: Path) -> list[str]:
 
 
 def pair_scene_frames(render_rgb_dir: Path, gt_rgb_dir: Path) -> list[tuple[str, Path, Path]]:
-    """Pair render ``{frame}_5_wide.*`` with GT ``{frame}_5_multiplane_wide.png``.
+    """Pair render ``{frame}_5_wide.*`` with GT ``{frame}_5_sparse_wide.png``.
 
     Frames are matched by their leading integer id (so frames need not start at
     000) and the canonical frame string is zero-padded to 3 digits.  Other
@@ -640,7 +640,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog=Path(sys.argv[0]).name if sys.argv and sys.argv[0] else None,
         description=(
             "Evaluate this project's direct 3x-wide renders ({frame}_5_wide.jpg) "
-            "against the sparse multiplane GT, following the DWSplat v2 protocol."
+            "against sparse wide-FOV GT ({frame}_5_sparse_wide.png), "
+            "following the DWSplat v2 protocol."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -659,8 +660,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--gt-root",
         default=None,
         help=(
-            "Sparse multiplane GT root: <root>/<scene>/{rgb,mask}/"
-            "{frame}_5_multiplane_wide.png. Default: the --dataset preset path."
+            "Sparse wide-FOV GT root: <root>/<scene>/{rgb,mask}/"
+            "{frame}_5_sparse_wide.png. Default: the --dataset preset path "
+            "(sparseWideFOVImages3_1344x256)."
         ),
     )
     parser.add_argument(
