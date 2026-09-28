@@ -1021,6 +1021,56 @@ Example derived inputs at the effective patch size 64:
 The output width factor stays the nuScenes-consistent default of `3x`
 (`--width-factor`; an input `256x448` renders `256x1344`).
 
+## Wide-image metrics
+
+`scripts/eval_wide_metrics.py` scores this project's **direct 3x-width wide
+renders** against the sparse multiplane GT used by the DWSplat
+`*_multiplane_v2.py` scripts (the protocol is re-implemented here; nothing is
+imported from that repository). It evaluates the files named
+`{frame}_5_wide.jpg` produced by the `inference_*_wide*.py` entry points — it
+does **not** evaluate the fixed-FOV `{frame}_fixedfov_wide.jpg` variants and it
+does **not** implement or evaluate WideDrive. The default model is `256x448`
+and `DEFAULT_WIDTH_FACTOR` is `3.0`, so a 448-wide input already renders at
+1344 wide; the metrics script resizes the render to the GT width regardless.
+
+- Render layout `<render-root>/<scene>/rgb/{frame}_5_wide.jpg` (an optional
+  `<render-root>/<scene>/mask/{frame}_5_wide.png` render mask is used when
+  present; our decoder does not save alpha so it is normally absent).
+- GT layout `<gt-root>/<scene>/{rgb,mask}/{frame}_5_multiplane_wide.png`.
+- The **render is bilinear-resized to the GT size** when the sizes differ; the
+  GT is never resized. Panel width is `gt_width // 3`, with Left / Center /
+  Right as three contiguous panels.
+- The **v2 mask rule** applies: Left/Right use the GT mask only (the render
+  mask is *not* intersected there), Center is `GT mask & render-valid`, and
+  `Center_masked` is Center `&` the camera-5 ego-car keep mask (white/bright =
+  keep, threshold 0.5). MAE/RMSE/PSNR are computed on masked pixels, Left/Right
+  use the sparse per-pixel SSIM, Center uses an 11x11 Gaussian-windowed SSIM
+  map, and center LPIPS (alex, spatial) is averaged over both center masks.
+
+```bash
+# Lyft 1920x1080: evaluate the direct 3x-wide renders (no LPIPS)
+python scripts/eval_wide_metrics.py \
+  --dataset lyft1920 --render-root outputs/lyft1920_wide --no-lpips
+
+# DDAD (per-scene ego-car masks); narrow to one scene / two frames
+python scripts/eval_wide_metrics.py \
+  --dataset ddad --render-root outputs/ddad_wide \
+  --max-scenes 1 --max-frames 2 --no-lpips
+
+# Explicit GT root and report path
+python scripts/eval_wide_metrics.py \
+  --dataset lyft1920 --render-root outputs/lyft1920_wide \
+  --gt-root datasets/lyft/1920_sparseMultiplaneWideFOVImages3 \
+  --output outputs/lyft1920_wide/metrics.txt
+```
+
+By default the report is written to
+`<render-root>/wide_metrics_<dataset>_<timestamp>.txt` and printed to stdout.
+The nuScenes sparse GT directory
+(`datasets/nuscenes/sparseMultiplaneImages3_1554x294`) is **not** in this
+checkout, so a nuScenes run fails with a clear error until that directory is
+present; pass `--gt-root` once it is.
+
 ## Speed benchmark
 
 `scripts/benchmark_nuscenes_wide.py` is the nuScenes entry point for the wide
